@@ -15,7 +15,6 @@ from torchlayers.upsample import ConvPixelShuffle
 
 from neo.models.down_sample_conv import DownSampleConv
 from neo.models.up_sample_conv import UpSampleConv
-from neo.models.gaussian_noise import GaussianNoise
 
 
 class Pix2PixGenerator(nn.Module):
@@ -66,7 +65,6 @@ class Pix2PixGenerator(nn.Module):
         )
 
         self.final_conv = nn.Conv2d(32, 1, kernel_size=1, stride=1, padding=0)
-        self.noise = GaussianNoise()
         self.tanh = nn.Tanh()
 
     def forward(self, x, identity_map):

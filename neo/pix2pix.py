@@ -91,7 +91,6 @@ class Pix2Pix:
         # Loss functions
         self.adversarial_criterion = nn.BCEWithLogitsLoss()
         self.recon_criterion_l1 = nn.L1Loss()
-        self.recon_criterion_l2 = nn.MSELoss()
         self.vgg_criterion = VGGLoss(self.device, weights=vgg_loss_weights)
         self.scattering_f = Scattering2D(
             J=3, L=8, shape=(input_size, input_size),
@@ -124,7 +123,7 @@ class Pix2Pix:
 
     def _gen_step(self, real_images, conditioned_images, hsc_hr, seg_map_real):
         """Compute generator loss with all components."""
-        fake_images = self.gen(conditioned_images, identity_map=True)
+        fake_images = self.gen(conditioned_images)
 
         # Center crop to remove border artifacts
         fake_images = CenterCrop(600)(fake_images)
@@ -161,11 +160,11 @@ class Pix2Pix:
 
     def generate_fake_images(self, conditioned_images, identity_map=False):
         """Generate super-resolved images from low-resolution inputs."""
-        return self.gen(conditioned_images, identity_map=identity_map)
+        return self.gen(conditioned_images)
 
     def _disc_step(self, real_images, conditioned_images, hsc_hr):
         """Compute discriminator loss on real and fake images."""
-        fake_images = self.gen(conditioned_images, identity_map=True).detach()
+        fake_images = self.gen(conditioned_images).detach()
 
         # Center crop to remove border artifacts
         fake_images = CenterCrop(600)(fake_images)
