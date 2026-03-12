@@ -1,4 +1,4 @@
-# NEO: Neural Enhancement Operator
+# NEO: Photometric Super-Resolution for Improving Galaxy Morphological Measurements using Conditional Generative Adversarial Networks
 
 **Astronomical image super-resolution using conditional GANs**
 
