@@ -66,6 +66,13 @@ We evaluate NEO on paired HSC/HST observations in the COSMOS field. NEO super-re
 
 We measure galaxy morphological parameters on NEO outputs and compare against HST ground truth. NEO substantially reduces systematic biases relative to the original HSC images across both single-exposure and mosaic settings. Bold indicates better performance.
 
+**Metrics:**
+- **B&#772;** (Mean Relative Bias): B&#772;<sub>p</sub> = (M<sub>p,X</sub> - M<sub>p,HST</sub>) / M<sub>p,HST</sub> — fractional deviation from HST ground truth (closer to 0 is better). Used for R<sub>e</sub>, FWHM, and C<sub>75/25</sub>.
+- **B&#772;<sub>q</sub>** (Absolute Bias): B<sub>q</sub> = M<sub>q,X</sub> - M<sub>q,HST</sub> — direct difference for axis ratio (closer to 0 is better).
+- **S** (Orientation Similarity): S = 1 - |Sc(u&#770;<sub>NEO</sub>, u&#770;<sub>HST</sub>)| — cosine similarity between galaxy orientation unit vectors (closer to 0 is better).
+
+**Parameters:** R<sub>e</sub> = effective radius (galaxy size), FWHM = full-width at half-maximum, q = axis ratio (ellipticity), C<sub>75/25</sub> = concentration (ratio of radii enclosing 75% and 25% of light).
+
 | Source | Mode | B&#772;<sub>R<sub>e</sub></sub> | B&#772;<sub>FWHM</sub> | B&#772;<sub>q</sub> | B&#772;<sub>C<sub>75/25</sub></sub> | S (Orientation) |
 |--------|------|---|---|---|---|---|
 | **NEO** | single | **0.04 &pm; 0.30** | **-0.02 &pm; 0.06** | **0.03 &pm; 0.04** | **8.70 &pm; 0.11 &times;10<sup>-3</sup>** | **5.60 &pm; 0.10 &times;10<sup>-4</sup>** |
