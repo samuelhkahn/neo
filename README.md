@@ -16,7 +16,7 @@ Ground-based telescopes are limited by atmospheric seeing, producing images with
 - **U-Net Generator**: Encoder-decoder architecture with skip connections for preserving spatial information
 - **Sub-Pixel Convolution**: PixelShuffle upsampling (3x then 2x) for artifact-free resolution enhancement
 - **PatchGAN Discriminator**: Classifies image patches as real/fake to encourage high-frequency detail
-- **Multi-Component Loss Function**: Combines 5 complementary loss terms for physically meaningful outputs
+- **Multi-Component Loss Function**: Combines 4 complementary loss terms for physically meaningful outputs
 
 ### Loss Function Components
 
@@ -25,8 +25,9 @@ Ground-based telescopes are limited by atmospheric seeing, producing images with
 | **BCE Adversarial** | Realism | PatchGAN discriminator ensures generated images look realistic |
 | **L1 Reconstruction** | Pixel accuracy | Direct pixel-wise comparison with ground truth |
 | **VGG-19 Perceptual** | Feature similarity | Multi-scale feature matching using pretrained VGG-19 |
-| **Wavelet Scattering** | Multi-scale structure | Preserves morphological structure across spatial scales via Kymatio scattering transform |
 | **Segmentation-Masked L1** | Source emphasis | Weighted reconstruction that prioritizes detected astronomical sources |
+
+> **Note:** A wavelet scattering loss (via Kymatio) is implemented in the codebase but was set to zero (`lambda_scattering = 0.0`) in the final experiments and is not part of the published loss function.
 
 ---
 
@@ -47,6 +48,8 @@ neo/
 │   └── vgg19_loss.py         # VGG perceptual loss module
 ├── data/
 │   ├── __init__.py           # Data exports
+│   ├── extract_sample.py     # Extract paired HSC/HST cutouts via WCS alignment
+│   ├── filter_samples.py     # Quality-filter cutouts by log-intensity range
 │   ├── dataset.py            # HST/HSC paired FITS dataset with transforms
 │   └── collate_fn.py         # Batch collation with NaN/Inf filtering
 └── configs/
@@ -122,9 +125,25 @@ export COMET_ML_ASTRO_API_KEY="your-api-key-here"
 
 ## Usage
 
-### Training
+### Data Preparation
 
-1. **Prepare your data**: Organize paired HST/HSC FITS cutouts into train/validation directories. File names must match between HST and HSC directories.
+Before training, you need to generate paired HSC/HST cutouts from the full mosaic images. Two scripts in `neo/data/` handle this:
+
+1. **Extract cutouts** (`neo/data/extract_sample.py`): Randomly samples pixel coordinates in the HSC mosaic, validates each location against an HST/HSC overlap mask (ensuring full coverage in both surveys), then uses WCS coordinate transforms to extract the corresponding HST cutout at the same sky position. Writes paired FITS files with matching filenames.
+
+   ```bash
+   python neo/data/extract_sample.py
+   ```
+
+   Before running, update the paths in `main()` to point to your HSC mosaic, HST mosaic, and overlap mask FITS files. The overlap mask can be generated with `get_hst_hsc_mask.py` (not included in this repo) using `reproject_interp` to project the HST footprint onto the HSC pixel grid.
+
+2. **Filter cutouts** (`neo/data/filter_samples.py`): Quality-filters the extracted samples by computing `log(sum of pixels)` on each HST cutout and keeping only those within a specified range (default: 2 < log(sum) < 7). This discards near-empty background cutouts and overly bright/saturated ones. Accepted pairs are copied to `filtered/` subdirectories.
+
+   ```bash
+   python neo/data/filter_samples.py
+   ```
+
+3. **Split into train/val**: Organize the filtered cutouts into train and validation directories. File names must match between HST and HSC directories.
 
    ```
    data/
@@ -134,7 +153,9 @@ export COMET_ML_ASTRO_API_KEY="your-api-key-here"
    └── hsc_val/         # HSC validation cutouts
    ```
 
-2. **Create a configuration file** (see `neo/configs/example.ini` for a template):
+### Training
+
+1. **Create a configuration file** (see `neo/configs/example.ini` for a template):
 
    ```ini
    [DEFAULT]
@@ -144,17 +165,16 @@ export COMET_ML_ASTRO_API_KEY="your-api-key-here"
    hsc_path_val = /path/to/hsc_val
    ```
 
-3. **Run training**:
+2. **Run training**:
 
    ```bash
    python train.py neo/configs/example.ini
    ```
 
-4. **Monitor training** on Comet ML. The following metrics are logged:
+3. **Monitor training** on Comet ML. The following metrics are logged:
    - Generator / Discriminator loss (train + validation)
    - VGG perceptual loss
    - L1 reconstruction loss
-   - Wavelet scattering loss
    - Segmentation-weighted reconstruction loss
    - Visual comparisons (HSC input, generated SR, ground truth HST, residuals)
 
@@ -255,28 +275,29 @@ Output: (1, H', W') patch predictions
 
 All training hyperparameters are set via an INI config file. See `neo/configs/example.ini` for a complete example.
 
-| Section | Key | Description | Example |
+| Section | Key | Description | Default |
 |---------|-----|-------------|---------|
-| `DEFAULT` | `hst_path_train` | Path to HST training FITS directory | `/data/hst/train` |
-| `DEFAULT` | `hsc_path_train` | Path to HSC training FITS directory | `/data/hsc/train` |
-| `DEFAULT` | `hst_path_val` | Path to HST validation FITS directory | `/data/hst/val` |
-| `DEFAULT` | `hsc_path_val` | Path to HSC validation FITS directory | `/data/hsc/val` |
-| `HST_DIM` | `hst_dim` | HST image dimension | `768` |
-| `HSC_DIM` | `hsc_dim` | HSC image dimension | `128` |
-| `BATCH_SIZE` | `batch_size` | Training batch size | `4` |
-| `GAN_STEPS` | `gan_steps` | Total training steps | `100000` |
-| `SAVE_STEPS` | `save_steps` | Checkpoint save frequency | `5000` |
-| `DISPLAY_STEPS` | `display_steps` | Logging/visualization frequency | `500` |
+| `DEFAULT` | `hst_path_train` | Path to HST training FITS directory | `/path/to/hst/train` |
+| `DEFAULT` | `hsc_path_train` | Path to HSC training FITS directory | `/path/to/hsc/train` |
+| `DEFAULT` | `hst_path_val` | Path to HST validation FITS directory | `/path/to/hst/val` |
+| `DEFAULT` | `hsc_path_val` | Path to HSC validation FITS directory | `/path/to/hsc/val` |
+| `HST_DIM` | `hst_dim` | HST image dimension (before padding) | `600` |
+| `HSC_DIM` | `hsc_dim` | HSC image dimension (before padding) | `100` |
+| `BATCH_SIZE` | `batch_size` | Training batch size | `8` |
+| `GAN_STEPS` | `gan_steps` | Total training steps | `2000000` |
+| `SAVE_STEPS` | `save_steps` | Checkpoint save frequency | `25000` |
+| `DISPLAY_STEPS` | `display_steps` | Logging/visualization frequency | `25` |
 | `LR` | `lr` | Generator learning rate | `0.0002` |
-| `DISC_LR` | `disc_lr` | Discriminator learning rate | `0.0002` |
+| `DISC_LR` | `disc_lr` | Discriminator learning rate | `0.00002` |
 | `LAMBDA_RECON` | `lambda_recon` | L1 reconstruction loss weight | `200` |
 | `LAMBDA_SEGMAP` | `lambda_segmap` | Segmentation-masked L1 weight | `200` |
-| `LAMBDA_VGG` | `lambda_vgg` | VGG perceptual loss weight | `200` |
-| `LAMBDA_SCATTERING` | `lambda_scattering` | Scattering loss weight | `1` |
-| `LAMBDA_ADV` | `lambda_adv` | Adversarial loss weight | `5` |
-| `DISC_UPDATE_FREQ` | `disc_update_freq` | Steps between discriminator updates | `3` |
-| `DATA_AUG` | `data_aug` | Enable data augmentation | `True` |
-| `VGG_LOSS_WEIGHTS` | `vgg_loss_weights` | Per-VGG-layer loss weights | `[1.0,1.0,0.0,0.0,0.0]` |
+| `LAMBDA_VGG` | `lambda_vgg` | VGG perceptual loss weight | `1` |
+| `LAMBDA_SCATTERING` | `lambda_scattering` | Scattering loss weight (set to 0 in final experiments) | `0.0` |
+| `LAMBDA_ADV` | `lambda_adv` | Adversarial loss weight | `1` |
+| `DISC_UPDATE_FREQ` | `disc_update_freq` | Steps between discriminator updates | `1` |
+| `GEN_UPDATE_FREQ` | `gen_update_freq` | Steps between generator updates | `1` |
+| `DATA_AUG` | `data_aug` | Enable data augmentation | `False` |
+| `VGG_LOSS_WEIGHTS` | `vgg_loss_weights` | Per-VGG-layer loss weights | `[0.0,1.0,1.0,0.0,0.0]` |
 
 ---
 
