@@ -43,31 +43,40 @@ neo/
 │   ├── patchgan.py           # PatchGAN discriminator
 │   ├── down_sample_conv.py   # Strided conv blocks (encoder + discriminator)
 │   ├── up_sample_conv.py     # Transpose conv blocks (decoder)
-│   ├── gaussian_noise.py     # Gaussian noise injection layer
 │   ├── vgg19.py              # VGG-19 feature extractor
 │   └── vgg19_loss.py         # VGG perceptual loss module
 ├── data/
 │   ├── __init__.py           # Data exports
 │   ├── dataset.py            # HST/HSC paired FITS dataset with transforms
 │   └── collate_fn.py         # Batch collation with NaN/Inf filtering
-├── analysis/                 # Post-training analysis notebooks and scripts
-│   ├── Examine-Batch-Detections.ipynb
-│   ├── Examine-Detections.ipynb
-│   ├── Mosaic Noise Propertis.ipynb
-│   ├── Noise Properties Plots.ipynb
-│   ├── compare-sr-fits.py
-│   ├── detect_and_mask.py
-│   ├── generate_sr_images.py
-│   ├── jades_photutils_interface.py
-│   ├── perform_batch_comparison.sh
-│   ├── perform_comparison.sh
-│   └── quicklook.py
 └── configs/
     └── example.ini           # Example training configuration
 
 train.py                      # Main training entry point
 requirements.txt              # Python dependencies
 ```
+
+---
+
+## Results
+
+We evaluate NEO on paired HSC/HST observations in the COSMOS field. NEO super-resolves ground-based HSC images (i-band, 0.168"/px, PSF FWHM ~1.3") to match space-based HST resolution (F814W, 0.03"/px, PSF FWHM ~0.09"), trained on ~1.5M cutout pairs with a 20% validation split.
+
+### Morphological Parameter Recovery
+
+We measure galaxy morphological parameters on NEO outputs and compare against HST ground truth. NEO substantially reduces systematic biases relative to the original HSC images:
+
+| Parameter | NEO Bias | HSC Bias | Improvement |
+|-----------|----------|----------|-------------|
+| Effective Radius | 0.04 &pm; 0.30 | 0.72 &pm; 0.18 | ~18x |
+| FWHM | -0.02 &pm; 0.06 | 0.82 &pm; 0.05 | ~41x |
+| Axis Ratio | 0.03 &pm; 0.04 | 0.11 &pm; 0.14 | ~3.7x |
+| Concentration | 8.7e-3 &pm; 0.11 | -0.20 &pm; 0.11 | ~23x |
+| Orientation | 5.6e-4 &pm; 0.10 | — | — |
+
+### PSF Recovery
+
+The NEO effective PSF (ePSF) closely approximates the HST ePSF structure, reproducing both the central core and diffraction spikes. Encircled energy differences are within 5% at a 4-pixel radius.
 
 ---
 
