@@ -64,15 +64,14 @@ We evaluate NEO on paired HSC/HST observations in the COSMOS field. NEO super-re
 
 ### Morphological Parameter Recovery
 
-We measure galaxy morphological parameters on NEO outputs and compare against HST ground truth. NEO substantially reduces systematic biases relative to the original HSC images:
+We measure galaxy morphological parameters on NEO outputs and compare against HST ground truth. NEO substantially reduces systematic biases relative to the original HSC images across both single-exposure and mosaic settings. Bold indicates better performance.
 
-| Parameter | NEO Bias | HSC Bias | Improvement |
-|-----------|----------|----------|-------------|
-| Effective Radius | 0.04 &pm; 0.30 | 0.72 &pm; 0.18 | ~18x |
-| FWHM | -0.02 &pm; 0.06 | 0.82 &pm; 0.05 | ~41x |
-| Axis Ratio | 0.03 &pm; 0.04 | 0.11 &pm; 0.14 | ~3.7x |
-| Concentration | 8.7e-3 &pm; 0.11 | -0.20 &pm; 0.11 | ~23x |
-| Orientation | 5.6e-4 &pm; 0.10 | — | — |
+| Source | Mode | B&#772;<sub>R<sub>e</sub></sub> | B&#772;<sub>FWHM</sub> | B&#772;<sub>q</sub> | B&#772;<sub>C<sub>75/25</sub></sub> | S (Orientation) |
+|--------|------|---|---|---|---|---|
+| **NEO** | single | **0.04 &pm; 0.30** | **-0.02 &pm; 0.06** | **0.03 &pm; 0.04** | **8.70 &pm; 0.11 &times;10<sup>-3</sup>** | **5.60 &pm; 0.10 &times;10<sup>-4</sup>** |
+| **NEO** | mosaic | **0.11 &pm; 0.15** | **0.04 &pm; 0.05** | **0.03 &pm; 0.04** | **0.09 &pm; 0.11** | **1.54 &pm; 0.06 &times;10<sup>-3</sup>** |
+| HSC | single | 0.72 &pm; 0.18 | 0.82 &pm; 0.05 | 0.11 &pm; 0.14 | -0.20 &pm; 0.11 | 6.6 &pm; 0.17 &times;10<sup>-3</sup> |
+| HSC | mosaic | 0.65 &pm; 0.98 | 0.13 &pm; 0.24 | 0.11 &pm; 0.14 | 0.11 &pm; 0.11 | 0.01 &pm; 0.18 |
 
 ### PSF Recovery
 
