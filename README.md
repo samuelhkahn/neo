@@ -1,4 +1,4 @@
-aa# NEO: Photometric Super-Resolution for Improving Galaxy Morphological Measurements using Conditional Generative Adversarial Networks
+# NEO: Photometric Super-Resolution for Improving Galaxy Morphological Measurements using Conditional Generative Adversarial Networks
 
 **Astronomical image super-resolution using conditional GANs**
 
