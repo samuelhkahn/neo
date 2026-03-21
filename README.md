@@ -1,4 +1,4 @@
-# NEO: Photometric Super-Resolution for Improving Galaxy Morphological Measurements using Conditional Generative Adversarial Networks
+aa# NEO: Photometric Super-Resolution for Improving Galaxy Morphological Measurements using Conditional Generative Adversarial Networks
 
 **Astronomical image super-resolution using conditional GANs**
 
@@ -321,4 +321,4 @@ Core requirements:
 
 ## License
 
-This project is provided for research and educational purposes.
+This project is licensed under the terms of the MIT license.
