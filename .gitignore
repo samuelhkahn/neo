@@ -25,7 +25,14 @@ build/
 # Environment
 .env
 venv/
+.venv/
 *.log
+.ruff_cache/
+.pytest_cache/
+
+# RSP credentials
+.rsp_token
+*.token
 
 # OS
 .DS_Store

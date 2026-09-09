@@ -1,5 +1,5 @@
 """
-NEO: Neural Enhancement Operator
+NEO: Photometric super-resolution with AI
 
 A deep learning framework for astronomical image super-resolution using
 Pix2Pix conditional GANs. Designed to enhance ground-based telescope imagery
