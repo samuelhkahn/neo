@@ -119,11 +119,12 @@ class SR_HST_HSC_Dataset(Dataset):
         self.filenames = os.listdir(hst_path)
         self.experiment = experiment
 
-        self.to_pil = transforms.ToPILImage()
+        # mode="F" keeps float pixels; the default would quantize them to 8-bit.
+        self.to_pil = transforms.ToPILImage(mode="F")
         self.to_tensor = transforms.ToTensor()
 
         self.hr_transforms = transforms.Compose([
-            transforms.ToPILImage(),
+            transforms.ToPILImage(mode="F"),
             transforms.Resize(600, interpolation=IMode.NEAREST),
             transforms.ToTensor(),
         ])
@@ -132,11 +133,11 @@ class SR_HST_HSC_Dataset(Dataset):
         self.square_pad_lr = SquarePad(14, "reflect")
 
         self.pad_array_hr = transforms.Compose([
-            transforms.ToPILImage(),
+            transforms.ToPILImage(mode="F"),
             self.square_pad_hr,
         ])
         self.pad_array_lr = transforms.Compose([
-            transforms.ToPILImage(),
+            transforms.ToPILImage(mode="F"),
             self.square_pad_lr,
         ])
 
@@ -324,12 +325,12 @@ class SR_HST_HSC_Dataset(Dataset):
             hst_transformation = self.ds9_scaling(hst_clipped, offset=1)
             hsc_clipped = self.clip(hsc_array, use_data=False)[0]
             hsc_transformation = self.ds9_scaling(hsc_clipped, offset=1)
-            hsc_hr = self.hr_transforms(hsc_transformation)
+            hsc_hr = self.hr_transforms(hsc_transformation.astype(np.float32))
 
         # Pad and convert to tensors
-        hst_seg_map = self.to_tensor(self.pad_array_hr(hst_seg_map)).squeeze(0)
-        hsc = self.to_tensor(self.pad_array_lr(hsc_transformation)).squeeze(0)
-        hst = self.to_tensor(self.pad_array_hr(hst_transformation)).squeeze(0)
+        hst_seg_map = self.to_tensor(self.pad_array_hr(hst_seg_map.astype(np.float32))).squeeze(0)
+        hsc = self.to_tensor(self.pad_array_lr(hsc_transformation.astype(np.float32))).squeeze(0)
+        hst = self.to_tensor(self.pad_array_hr(hst_transformation.astype(np.float32))).squeeze(0)
         hsc_hr = self.to_tensor(self.pad_array_hr(hsc_hr)).squeeze(0)
 
         return hst, hsc, hsc_hr, hst_seg_map

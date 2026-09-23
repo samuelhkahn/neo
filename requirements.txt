@@ -1,7 +1,5 @@
 torch>=1.9.0
 torchvision>=0.10.0
-torchlayers>=0.1.1
-kymatio>=0.3.0
 comet-ml>=3.31.0
 astropy>=5.0
 sep>=1.2.0

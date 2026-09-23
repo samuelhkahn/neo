@@ -27,7 +27,7 @@ Ground-based telescopes are limited by atmospheric seeing, producing images with
 | **VGG-19 Perceptual** | Feature similarity | Multi-scale feature matching using pretrained VGG-19 |
 | **Segmentation-Masked L1** | Source emphasis | Weighted reconstruction that prioritizes detected astronomical sources |
 
-> **Note:** A wavelet scattering loss (via Kymatio) is implemented in the codebase but was set to zero (`lambda_scattering = 0.0`) in the final experiments and is not part of the published loss function.
+> **Note:** A wavelet scattering loss was explored during development but carried zero weight in the final experiments; it is not part of the published loss function and has been removed from the codebase.
 
 ---
 
@@ -285,6 +285,7 @@ All training hyperparameters are set via an INI config file. See `neo/configs/ex
 | `HSC_DIM` | `hsc_dim` | HSC image dimension (before padding) | `100` |
 | `BATCH_SIZE` | `batch_size` | Training batch size | `8` |
 | `GAN_STEPS` | `gan_steps` | Total training steps | `2000000` |
+| `COMET_PROJECT` | `comet_project` | Comet ML project name | `neo-rubin-lsst` |
 | `SAVE_STEPS` | `save_steps` | Checkpoint save frequency | `25000` |
 | `DISPLAY_STEPS` | `display_steps` | Logging/visualization frequency | `25` |
 | `LR` | `lr` | Generator learning rate | `0.0002` |
@@ -292,7 +293,6 @@ All training hyperparameters are set via an INI config file. See `neo/configs/ex
 | `LAMBDA_RECON` | `lambda_recon` | L1 reconstruction loss weight | `200` |
 | `LAMBDA_SEGMAP` | `lambda_segmap` | Segmentation-masked L1 weight | `200` |
 | `LAMBDA_VGG` | `lambda_vgg` | VGG perceptual loss weight | `1` |
-| `LAMBDA_SCATTERING` | `lambda_scattering` | Scattering loss weight (set to 0 in final experiments) | `0.0` |
 | `LAMBDA_ADV` | `lambda_adv` | Adversarial loss weight | `1` |
 | `DISC_UPDATE_FREQ` | `disc_update_freq` | Steps between discriminator updates | `1` |
 | `GEN_UPDATE_FREQ` | `gen_update_freq` | Steps between generator updates | `1` |
@@ -307,8 +307,6 @@ Core requirements:
 
 - **PyTorch** (>= 1.9) — Deep learning framework
 - **torchvision** — VGG-19 pretrained model, image transforms
-- **torchlayers** — PixelShuffle convolution modules
-- **kymatio** — Wavelet scattering transform
 - **comet-ml** — Experiment tracking and visualization
 - **astropy** — FITS file I/O and image normalization
 - **sep** — Source Extractor (Python) for segmentation maps

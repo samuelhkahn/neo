@@ -11,8 +11,8 @@ Architecture:
 
 import torch
 import torch.nn as nn
-from torchlayers.upsample import ConvPixelShuffle
 
+from neo.models.conv_pixel_shuffle import ConvPixelShuffle
 from neo.models.down_sample_conv import DownSampleConv
 from neo.models.up_sample_conv import UpSampleConv
 
@@ -67,12 +67,12 @@ class Pix2PixGenerator(nn.Module):
         self.final_conv = nn.Conv2d(32, 1, kernel_size=1, stride=1, padding=0)
         self.tanh = nn.Tanh()
 
-    def forward(self, x, identity_map):
+    def forward(self, x, identity_map=False):
         """Forward pass through the generator.
 
         Args:
             x: Low-resolution input tensor of shape (B, 1, 128, 128).
-            identity_map: If True, skip noise injection (used during inference).
+            identity_map: Unused; accepted so older calling code keeps working.
 
         Returns:
             Super-resolved output tensor of shape (B, 1, 768, 768).

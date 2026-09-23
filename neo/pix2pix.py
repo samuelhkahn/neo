@@ -5,7 +5,6 @@ astronomical imagery:
     - BCE adversarial loss (PatchGAN discriminator)
     - L1 reconstruction loss
     - VGG-19 perceptual loss
-    - Wavelet scattering transform loss (preserves multi-scale structure)
     - Segmentation-masked L1 loss (emphasizes source regions)
 """
 
@@ -13,8 +12,6 @@ import os
 
 import torch
 import torch.nn as nn
-import torchlayers as tl
-from kymatio.torch import Scattering2D
 from torchvision import transforms
 from torchvision.transforms import CenterCrop
 from torchvision.transforms.functional import InterpolationMode as IMode
@@ -29,32 +26,30 @@ class Pix2Pix:
 
     Trains a U-Net generator to produce HST-quality images from HSC inputs,
     using a PatchGAN discriminator and a composite loss function that
-    balances adversarial, reconstruction, perceptual, scattering, and
+    balances adversarial, reconstruction, perceptual, and
     segmentation-weighted objectives.
 
     Args:
         in_channels: Number of input image channels.
         out_channels: Number of output image channels.
-        input_size: Spatial size of the cropped training images (for scattering transform).
-        device: Torch device ('cuda' or 'cpu').
+        device: Torch device ('cuda', 'mps' or 'cpu').
         vgg_loss_weights: Per-layer weights for VGG perceptual loss (5 values).
         learning_rate: Generator learning rate.
         disc_learning_rate: Discriminator learning rate.
         lambda_recon: Weight for L1 reconstruction loss.
         lambda_segmap: Weight for segmentation-masked L1 loss.
         lambda_vgg: Weight for VGG perceptual loss.
-        lambda_scattering: Weight for wavelet scattering loss.
         lambda_adv: Weight for adversarial loss.
         display_step: Logging frequency (in training steps).
         pretrained_generator: Filename of pretrained generator checkpoint (or empty string).
         pretrained_discriminator: Filename of pretrained discriminator checkpoint (or empty string).
     """
 
-    def __init__(self, in_channels, out_channels, input_size, device,
+    def __init__(self, in_channels, out_channels, device,
                  vgg_loss_weights=(1.0, 1.0, 0.0, 0.0, 0.0),
                  learning_rate=0.0002, disc_learning_rate=0.0002,
                  lambda_recon=200, lambda_segmap=200, lambda_vgg=200,
-                 lambda_scattering=1, lambda_adv=5, display_step=25,
+                 lambda_adv=5, display_step=25,
                  pretrained_generator="", pretrained_discriminator=""):
 
         super().__init__()
@@ -66,16 +61,15 @@ class Pix2Pix:
         if pretrained_generator:
             print(f"Loading Pretrained Generator: {pretrained_generator}")
             path = os.path.join(os.getcwd(), "models", pretrained_generator)
-            self.gen = torch.load(path)
+            self.gen = torch.load(path, weights_only=False)
         else:
             self.gen = Pix2PixGenerator(in_channels, out_channels)
-            tl.build(self.gen, torch.randn(1, 1, 128, 128), True)
 
         # Initialize discriminator
         if pretrained_discriminator:
             print(f"Loading Pretrained Discriminator: {pretrained_discriminator}")
             path = os.path.join(os.getcwd(), "models", pretrained_discriminator)
-            self.patch_gan = torch.load(path)
+            self.patch_gan = torch.load(path, weights_only=False)
         else:
             self.patch_gan = PatchGAN(2)
 
@@ -84,7 +78,6 @@ class Pix2Pix:
         self.disc_lr = disc_learning_rate
         self.lambda_recon = lambda_recon
         self.lambda_vgg = lambda_vgg
-        self.lambda_scattering = lambda_scattering
         self.lambda_adv = lambda_adv
         self.lambda_segmap = lambda_segmap
 
@@ -92,10 +85,6 @@ class Pix2Pix:
         self.adversarial_criterion = nn.BCEWithLogitsLoss()
         self.recon_criterion_l1 = nn.L1Loss()
         self.vgg_criterion = VGGLoss(self.device, weights=vgg_loss_weights)
-        self.scattering_f = Scattering2D(
-            J=3, L=8, shape=(input_size, input_size),
-            out_type="array", max_order=2,
-        ).to(device)
 
         # Optimizers
         self.gen_opt = torch.optim.Adam(self.gen.parameters(), lr=self.lr)
@@ -142,21 +131,15 @@ class Pix2Pix:
         vgg_loss = self.vgg_criterion(fake_images, real_images)
         segmap_loss = self.l1_loss_with_mask(fake_images, real_images, seg_map_real)
 
-        # Wavelet scattering loss
-        scat_real = self.scattering_f(real_images.contiguous()).squeeze(1)[:, 1:, :, :]
-        scat_fake = self.scattering_f(fake_images.contiguous()).squeeze(1)[:, 1:, :, :]
-        scattering_loss = (scat_real - scat_fake).abs().sum(axis=(1, 2, 3)).mean()
-
         # Weighted total loss
         total_loss = self.lr * (
             self.lambda_adv * adversarial_loss
             + self.lambda_recon * recon_loss
             + self.lambda_vgg * vgg_loss
-            + self.lambda_scattering * scattering_loss
             + self.lambda_segmap * segmap_loss
         )
 
-        return total_loss, adversarial_loss, recon_loss, vgg_loss, scattering_loss, segmap_loss
+        return total_loss, adversarial_loss, recon_loss, vgg_loss, segmap_loss
 
     def generate_fake_images(self, conditioned_images, identity_map=False):
         """Generate super-resolved images from low-resolution inputs."""
@@ -193,7 +176,7 @@ class Pix2Pix:
             optimizer: Which model to train - "generator" or "discriminator".
 
         Returns:
-            For generator: (total_loss, adv_loss, recon_loss, vgg_loss, scat_loss, seg_loss)
+            For generator: (total_loss, adv_loss, recon_loss, vgg_loss, seg_loss)
             For discriminator: (disc_loss, fake_logits, real_logits)
         """
         if optimizer == "discriminator":

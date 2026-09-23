@@ -6,7 +6,7 @@ from astropy.visualization import simple_norm
 
 
 def log_figure(img, fig_name, experiment, cmap="plasma", set_lims=False,
-               lims=(-1, 1), stretch="linear"):
+               lims=(-1, 1), stretch="linear", step=None):
     """Create and log an astronomical image figure to a Comet ML experiment.
 
     Renders the image with a colorbar using astronomical conventions
@@ -20,6 +20,7 @@ def log_figure(img, fig_name, experiment, cmap="plasma", set_lims=False,
         set_lims: If True, use explicit vmin/vmax from ``lims``.
         lims: Tuple of (vmin, vmax) for color scaling.
         stretch: Astropy normalization stretch (e.g., "linear", "log", "asinh").
+        step: Training step to attach to the figure.
     """
     f, ax = plt.subplots()
 
@@ -38,5 +39,5 @@ def log_figure(img, fig_name, experiment, cmap="plasma", set_lims=False,
     ax.set_yticks([])
     plt.tight_layout()
 
-    experiment.log_figure(figure_name=fig_name, figure=f)
+    experiment.log_figure(figure_name=fig_name, figure=f, step=step)
     plt.close()
