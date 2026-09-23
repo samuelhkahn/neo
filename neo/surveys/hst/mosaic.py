@@ -1,4 +1,4 @@
-"""The CANDELS COSMOS F814W mosaic: one large TAN-projected FITS image in counts/s, 0 = no data."""
+"""HST drizzled mosaics: TAN-projected FITS images in counts/s with 0 marking no data."""
 
 from pathlib import Path
 
@@ -17,15 +17,29 @@ def njy_per_count(zeropoint_ab: float) -> float:
     return 1e9 * 10 ** (-0.4 * (zeropoint_ab - 8.90))
 
 
-class CandelsMosaic:
+# ACS/WFC F814W AB zeropoint; needed for mosaics whose headers omit PHOTFLAM/PHOTPLAM
+# (e.g. COSMOS-Web DR1, units electron/s).
+F814W_AB_ZEROPOINT = 25.94
+
+
+class HstMosaic:
     bunit = "count/s"
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, zeropoint: float | None = None):
+        self.path = Path(path)
         self._hdul = fits.open(path, memmap=True)
         self.hdu = self._hdul[0]
         self.wcs = WCS(self.hdu.header)
         self.shape = self.hdu.shape
-        self.zeropoint = ab_zeropoint(self.hdu.header["PHOTFLAM"], self.hdu.header["PHOTPLAM"])
+        if zeropoint is not None:
+            self.zeropoint = zeropoint
+        elif "PHOTFLAM" in self.hdu.header and "PHOTPLAM" in self.hdu.header:
+            self.zeropoint = ab_zeropoint(self.hdu.header["PHOTFLAM"], self.hdu.header["PHOTPLAM"])
+        else:
+            raise ValueError(
+                f"{self.path.name} has no PHOTFLAM/PHOTPLAM; pass an explicit zeropoint "
+                f"(F814W AB = {F814W_AB_ZEROPOINT})"
+            )
         self.njy_per_count = njy_per_count(self.zeropoint)
 
     def close(self) -> None:
@@ -56,3 +70,34 @@ class CandelsMosaic:
     @staticmethod
     def valid(data: np.ndarray) -> np.ndarray:
         return np.isfinite(data) & (data != 0)
+
+
+class MosaicSet:
+    """One or more mosaics (e.g. IRSA tiles) treated as a single sky coverage."""
+
+    bunit = HstMosaic.bunit
+
+    def __init__(self, paths, zeropoint: float | None = None):
+        self.mosaics = [HstMosaic(p, zeropoint=zeropoint) for p in paths]
+        if not self.mosaics:
+            raise ValueError("MosaicSet needs at least one mosaic")
+        zeropoints = [m.zeropoint for m in self.mosaics]
+        if max(zeropoints) - min(zeropoints) > 1e-3:
+            raise ValueError(f"mosaics have different zeropoints: {zeropoints}")
+        self.zeropoint = zeropoints[0]
+        self.njy_per_count = self.mosaics[0].njy_per_count
+
+    def close(self) -> None:
+        for m in self.mosaics:
+            m.close()
+
+    def overlapping(self, ra_min, ra_max, dec_min, dec_max) -> list[HstMosaic]:
+        return [m for m in self.mosaics if m.region_slices(ra_min, ra_max, dec_min, dec_max)]
+
+    def regions(self, ra_min, ra_max, dec_min, dec_max) -> list[tuple[np.ndarray, WCS]]:
+        out = []
+        for m in self.mosaics:
+            region = m.region(ra_min, ra_max, dec_min, dec_max)
+            if region is not None:
+                out.append(region)
+        return out

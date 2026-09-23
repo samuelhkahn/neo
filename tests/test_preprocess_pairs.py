@@ -5,11 +5,11 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
 from conftest import make_tan_wcs
-from test_hst_candels import write_mosaic
+from test_hst_mosaic import write_mosaic
 
 from neo.preprocess import pairs
 from neo.preprocess.grid import lr_window_mask
-from neo.surveys.hst.candels import CandelsMosaic
+from neo.surveys.hst.mosaic import MosaicSet
 
 F = 6
 AREA_RATIO = (0.2 / F / 0.03) ** 2  # HR output pixel area / mosaic pixel area
@@ -78,6 +78,15 @@ def test_split_masks_never_share_rows():
     assert pairs.split_masks(ok, 0.0)["train"].all()
 
 
+def test_split_masks_follows_coverage_not_image_height():
+    ok = np.zeros((20, 6), bool)
+    ok[2:12] = True
+    masks = pairs.split_masks(ok, 0.3)
+    assert masks["train"][2:9].all() and not masks["train"][9:].any()
+    assert masks["val"][9:12].all() and not masks["val"][:9].any()
+    assert not pairs.split_masks(np.zeros((5, 5), bool), 0.3)["val"].any()
+
+
 def test_cutout_hdu_shifts_wcs_and_adds_cards():
     wcs = make_tan_wcs(0.2, (24, 24))
     hdu = pairs.cutout_hdu(np.zeros((4, 5), np.float32), wcs, 10, 3, {"LRX0": 3})
@@ -106,7 +115,7 @@ def test_process_patch_end_to_end(tmp_path):
     lr_path = tmp_path / "deep_coadd_1_2_i.fits"
     fits.HDUList([fits.PrimaryHDU(), image, mask]).writeto(lr_path)
     write_mosaic(tmp_path / "mosaic.fits", hr_data, hr_wcs)
-    mosaic = CandelsMosaic(tmp_path / "mosaic.fits")
+    mosaic = MosaicSet([tmp_path / "mosaic.fits"])
     out = tmp_path / "pairs"
     for split in ("train", "val"):
         for kind in ("lr", "hr"):

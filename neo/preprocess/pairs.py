@@ -1,9 +1,9 @@
 """Extract paired low/high resolution cutouts for super-resolution training.
 
-Each LR image gets an HR grid nested exactly `factor` times finer than its own pixels, and the
-HR mosaic is reprojected (flux-conserving) onto that grid, so an LR window and its HR counterpart
-cover the same sky. A band of rows in every LR image is reserved for validation, and no window
-straddles the boundary, so train and val cutouts never share a pixel.
+Each LR image gets an HR grid nested exactly `factor` times finer than its own pixels, and every
+HR mosaic tile overlapping it is reprojected (flux-conserving) onto that grid, so an LR window and
+its HR counterpart cover the same sky. A band of rows in every LR image is reserved for validation,
+and no window straddles the boundary, so train and val cutouts never share a pixel.
 """
 
 import argparse
@@ -19,7 +19,7 @@ from reproject import reproject_adaptive
 from scipy.ndimage import binary_erosion
 
 from neo.preprocess.grid import lr_window_mask, upsampled_wcs
-from neo.surveys.hst.candels import CandelsMosaic
+from neo.surveys.hst.mosaic import MosaicSet
 from neo.surveys.rubin.coadd import flagged_pixels, load_coadd
 
 DEFAULT_REJECT = ("NO_DATA", "SATURATED")
@@ -47,6 +47,17 @@ def overlap_box(lr_wcs: WCS, lr_shape, hr_wcs: WCS, hr_shape, pad: int = 2):
     return y0, y1, x0, x1
 
 
+def union_box(boxes):
+    boxes = [b for b in boxes if b is not None]
+    if not boxes:
+        return None
+    y0 = min(b[0] for b in boxes)
+    y1 = max(b[1] for b in boxes)
+    x0 = min(b[2] for b in boxes)
+    x1 = max(b[3] for b in boxes)
+    return y0, y1, x0, x1
+
+
 def hr_on_lr_grid(hr_data, hr_wcs, lr_wcs, lr_shape, factor, block_size=2048, parallel=False):
     """Flux-conserving reprojection of `hr_data` onto the grid nested `factor`x inside `lr_wcs`."""
     target = upsampled_wcs(lr_wcs, factor)
@@ -61,6 +72,21 @@ def hr_on_lr_grid(hr_data, hr_wcs, lr_wcs, lr_shape, factor, block_size=2048, pa
     )
     valid = (footprint > 0) & np.isfinite(hr) & (hr != 0)
     return np.nan_to_num(hr).astype(np.float32), valid, target
+
+
+def merge_on_lr_grid(regions, lr_wcs, lr_shape, factor, block_size=2048, parallel=False):
+    """Reproject several HR tiles onto one nested grid; the first tile with data wins per pixel."""
+    hr = np.zeros((lr_shape[0] * factor, lr_shape[1] * factor), np.float32)
+    valid = np.zeros_like(hr, dtype=bool)
+    hr_wcs = None
+    for data, wcs in regions:
+        tile, tile_valid, hr_wcs = hr_on_lr_grid(
+            data, wcs, lr_wcs, lr_shape, factor, block_size, parallel
+        )
+        take = tile_valid & ~valid
+        hr[take] = tile[take]
+        valid |= take
+    return hr, valid, hr_wcs
 
 
 def full_window_corners(ok: np.ndarray, size: int) -> np.ndarray:
@@ -83,8 +109,14 @@ def sample_windows(ok: np.ndarray, size: int, n: int, rng) -> tuple[list[tuple[i
 
 
 def split_masks(ok: np.ndarray, val_frac: float) -> dict[str, np.ndarray]:
-    """Train uses the top rows, val the bottom ones; windows cannot cross the boundary."""
-    split = int(round(ok.shape[0] * (1 - val_frac)))
+    """Train uses the top rows, val the bottom ones; windows cannot cross the boundary.
+
+    The boundary is placed at the (1 - val_frac) quantile of rows that contain valid pixels,
+    so val gets its share even when coverage does not reach the bottom of the image.
+    """
+    rows = np.flatnonzero(ok.any(axis=1))
+    cut = int(round(len(rows) * (1 - val_frac)))
+    split = rows[cut] if cut < len(rows) else ok.shape[0]
     train, val = ok.copy(), ok.copy()
     train[split:, :] = False
     val[:split, :] = False
@@ -103,17 +135,16 @@ def process_patch(
 ):
     counts = {"train": 0, "val": 0, "valid": 0}
     coadd = load_coadd(lr_path)
-    region = mosaic.region(*sky_bbox(coadd.wcs, coadd.image.shape))
-    if region is None:
-        return counts
-    hr_data, hr_region_wcs = region
-    box = overlap_box(coadd.wcs, coadd.image.shape, hr_region_wcs, hr_data.shape)
+    regions = mosaic.regions(*sky_bbox(coadd.wcs, coadd.image.shape))
+    box = union_box(
+        overlap_box(coadd.wcs, coadd.image.shape, wcs, data.shape) for data, wcs in regions
+    )
     if box is None:
         return counts
     y0, y1, x0, x1 = box
     sub_wcs = coadd.wcs[y0:y1, x0:x1]
-    hr, hr_valid, hr_wcs = hr_on_lr_grid(
-        hr_data, hr_region_wcs, sub_wcs, (y1 - y0, x1 - x0), factor, block_size, parallel
+    hr, hr_valid, hr_wcs = merge_on_lr_grid(
+        regions, sub_wcs, (y1 - y0, x1 - x0), factor, block_size, parallel
     )
     # Erode one LR pixel so windows stay clear of the resampled footprint edge.
     ok = binary_erosion(lr_window_mask(hr_valid, factor))
@@ -149,7 +180,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--lr-dir", required=True, help="directory of LR FITS images")
     parser.add_argument("--lr-glob", default="*.fits", help="pattern for LR files in --lr-dir")
-    parser.add_argument("--hr-mosaic", required=True, help="HR mosaic FITS (CANDELS F814W)")
+    parser.add_argument(
+        "--hr-mosaic",
+        required=True,
+        nargs="+",
+        help="HR mosaic FITS file(s), e.g. COSMOS-Web tiles",
+    )
+    parser.add_argument(
+        "--hr-zeropoint",
+        type=float,
+        default=None,
+        help="AB zeropoint for HR mosaics lacking PHOTFLAM (COSMOS-Web F814W: 25.94)",
+    )
     parser.add_argument("--out", required=True, help="output dir; gets {train,val}/{lr,hr}/")
     parser.add_argument("--lr-size", type=int, default=142, help="LR cutout size in pixels")
     parser.add_argument("--factor", type=int, default=6, help="HR/LR pixel scale ratio")
@@ -173,7 +215,7 @@ def main(argv=None) -> None:
     args = parse_args(argv)
     warnings.simplefilter("ignore", AstropyWarning)
     lr_paths = sorted(Path(args.lr_dir).glob(args.lr_glob))[: args.limit]
-    mosaic = CandelsMosaic(args.hr_mosaic)
+    mosaic = MosaicSet(args.hr_mosaic, zeropoint=args.hr_zeropoint)
     out = Path(args.out)
     pair_bytes = 4 * (args.lr_size**2 + (args.lr_size * args.factor) ** 2)
 
@@ -182,12 +224,11 @@ def main(argv=None) -> None:
         for path in lr_paths:
             header = fits.getheader(path, "IMAGE")
             shape = (header["NAXIS2"], header["NAXIS1"])
-            slices = mosaic.region_slices(*sky_bbox(WCS(header), shape))
-            if slices is None:
+            tiles = mosaic.overlapping(*sky_bbox(WCS(header), shape))
+            if not tiles:
                 continue
             n_overlap += 1
-            ys, xs = slices
-            print(f"  {path.name}: mosaic region {ys.stop - ys.start} x {xs.stop - xs.start} px")
+            print(f"  {path.name}: {len(tiles)} tile(s): {', '.join(t.path.name for t in tiles)}")
         n_max = n_overlap * args.per_patch
         print(
             f"{n_overlap}/{len(lr_paths)} LR images overlap the mosaic: "
