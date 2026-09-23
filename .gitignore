@@ -5,6 +5,7 @@
 # Data files
 *.fits
 *.zip
+/data/
 
 # Python
 __pycache__/
@@ -33,6 +34,12 @@ venv/
 # RSP credentials
 .rsp_token
 *.token
+
+# Comet offline experiment archives
+comet_offline/
+
+# Slurm job output
+logs/
 
 # OS
 .DS_Store
