@@ -10,7 +10,8 @@ fi
 export PATH="$HOME/.local/bin:$PATH"
 
 uv python install 3.12
-# pyproject pins CUDA 12.6 torch wheels on Linux (V100-compatible); nothing else is needed from `module`.
+# pyproject pins torch 2.6.0 CUDA 12.4 wheels on Linux (the newest that run on Lux's glibc 2.17 and the
+# V100s); the wheels bundle the CUDA runtime, so nothing is needed from `module`.
 uv sync --extra train --extra rubin
 
 mkdir -p logs   # Slurm will not create the --output directory itself
