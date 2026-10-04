@@ -24,6 +24,8 @@ export PYTHONUNBUFFERED=1   # print() lines reach logs/ as they happen, not at e
 : "${NEO_DATA:?set NEO_DATA}"
 CONFIG="${CONFIG:-neo/configs/lux.ini}"
 source scripts/lux/comet_check.sh
+# refuse to resume checkpoints trained on another pairs build (neo/preprocess/manifest.py)
+uv run python -m neo.preprocess.manifest guard "$CONFIG"
 
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 uv run python train.py "$CONFIG" --resume
