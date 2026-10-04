@@ -123,3 +123,76 @@ def test_compare_keeps_each_sky_group_in_one_subset():
     selected = sum(in_subset(n, "select", groups) for n in names)
     assert 0 < selected < 200
     assert all(in_subset(n, "select", groups) != in_subset(n, "report", groups) for n in names)
+
+
+def clean_scene(tmp_path):
+    """Two train and twelve val cutouts, all well apart."""
+    wcs = make_tan_wcs(0.2, (600, 600))
+    write_pair(tmp_path, "train", "t0.fits", wcs, 0, 0)
+    write_pair(tmp_path, "train", "t1.fits", wcs, 0, 100)
+    for k in range(12):
+        write_pair(tmp_path, "val", f"v{k:02d}.fits", wcs, 300 + 40 * (k // 6), 40 * (k % 6))
+    return wcs
+
+
+def test_apply_writes_val_select_and_manifest(tmp_path):
+    from neo.eval.subsets import in_subset
+    from neo.preprocess.manifest import read_build
+
+    clean_scene(tmp_path)
+    assert leakage.main(["--pairs", str(tmp_path)]) == 1  # outputs missing
+    assert leakage.main(["--pairs", str(tmp_path), "--apply"]) == 0
+    assert leakage.main(["--pairs", str(tmp_path)]) == 0
+    groups = load_groups(tmp_path / "val")
+    expected = {
+        f"v{k:02d}.fits" for k in range(12) if in_subset(f"v{k:02d}.fits", "select", groups)
+    }
+    for kind in ("lr", "hr"):
+        linked = {p.name for p in (tmp_path / "val_select" / kind).glob("*.fits")}
+        assert linked == expected
+        for p in (tmp_path / "val_select" / kind).glob("*.fits"):
+            assert p.is_symlink() and p.resolve() == (tmp_path / "val" / kind / p.name).resolve()
+    build = read_build(tmp_path)
+    assert build and len(build) == 16
+    # the dry run notices a stale val_select and a changed build
+    next(iter((tmp_path / "val_select" / "lr").glob("*.fits")), tmp_path / "x").unlink(
+        missing_ok=True
+    )
+    (tmp_path / "train" / "lr" / "t1.fits").rename(tmp_path / "t1_lr.fits")
+    (tmp_path / "train" / "hr" / "t1.fits").rename(tmp_path / "t1_hr.fits")
+    assert leakage.main(["--pairs", str(tmp_path)]) == 1
+    assert leakage.main(["--pairs", str(tmp_path), "--apply"]) == 0
+    assert read_build(tmp_path) != build and leakage.main(["--pairs", str(tmp_path)]) == 0
+
+
+def test_incomplete_pairs_are_problems_and_quarantined(tmp_path):
+    clean_scene(tmp_path)
+    (tmp_path / "train" / "lr" / "t0.fits").unlink()  # hr/t0.fits is now an orphan
+    assert leakage.main(["--pairs", str(tmp_path), "--apply"]) == 0
+    assert (tmp_path / "quarantine" / "train" / "hr" / "t0.fits").exists()
+    assert not (tmp_path / "train" / "hr" / "t0.fits").exists()
+    assert leakage.main(["--pairs", str(tmp_path)]) == 0
+
+
+def test_projection_stretch_never_shrinks_the_margin():
+    corners = np.array([[[150.0, 2.0]] * 4, [[150.6, 2.5]] * 4])
+    _, stretch = leakage.tangent_plane(corners, return_stretch=True)
+    assert 1.0 < stretch < 1.0001
+
+
+def test_guard_refuses_checkpoints_from_another_pairs_build(tmp_path):
+    from neo.preprocess import manifest
+
+    pairs, ckpt = tmp_path / "pairs", tmp_path / "ckpt"
+    config = tmp_path / "train.ini"
+    config.write_text(
+        f"[DEFAULT]\nhst_path_train = {pairs}/train/hr\n[CHECKPOINT]\nckpt_dir = {ckpt}\n"
+    )
+    assert manifest.guard(config) == 1  # no manifest yet
+    manifest.write_manifest(pairs.mkdir() or pairs, [("train", "a", "x:1:2")])
+    assert manifest.guard(config) == 0  # new run: stamps the build
+    (ckpt / "latest.pt").write_bytes(b"")
+    assert manifest.guard(config) == 0  # same build: resume allowed
+    manifest.write_manifest(pairs, [("train", "a", "x:1:3")])
+    assert manifest.guard(config) == 1  # other build: refused
+    assert manifest.main(["guard", str(config)]) == 1
