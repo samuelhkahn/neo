@@ -12,6 +12,7 @@
 # 12-step end-to-end check on one GPU: env, CUDA, data loading, losses, Comet. Run before train.sbatch.
 # Lux: account, qos and partition must all be given (they share a name). No GPU GRES is configured, so
 # --exclusive takes a whole comp-astro node (2x V100) and training uses GPU 0.
+# CONFIG / ENTRY select another experiment's smoke run (defaults: NEO, train.py).
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 export PATH="$HOME/.local/bin:$PATH"
@@ -19,4 +20,4 @@ export PATH="$HOME/.local/bin:$PATH"
 
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 uv run python -c "import torch; print('torch', torch.__version__, torch.version.cuda, '|', torch.cuda.get_device_name(0), 'sm', torch.cuda.get_device_capability(0))"
-uv run python train.py neo/configs/lux_smoke.ini
+uv run python "${ENTRY:-train.py}" "${CONFIG:-neo/configs/lux_smoke.ini}"
