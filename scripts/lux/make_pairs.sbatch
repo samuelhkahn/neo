@@ -15,13 +15,22 @@
 # val share no sky; then neo.preprocess.leakage verifies that on the written cutouts, quarantines
 # anything that still conflicts, and writes val/groups.csv for compare.py.
 # Knobs: NEO_DATA (required), TRAIN_DENSITY (train windows per train pixel; 4 covers ~98% of the
-# train sky; ~3 MB per pair), VAL_FRAC, SEED. The output directory must not already hold pairs.
+# train sky; ~3 MB per pair), VAL_FRAC, SEED.
+# Resumable: if the job dies or times out, submit it again with the same settings and it continues
+# where it stopped (finished LSST images are skipped). An output directory holding pairs from any
+# other run or settings is refused; delete it first.
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 export PATH="$HOME/.local/bin:$PATH"
 export PYTHONUNBUFFERED=1   # print() lines reach logs/ as they happen, not at exit
 : "${NEO_DATA:?set NEO_DATA}"
 PAIRS="$NEO_DATA/pairs/cosmos_web_i"
+# reproject's parallel mode spills ~6 GB of zarr chunks per LSST image to $TMPDIR; a compute node's
+# /tmp can be too small, so use a per-job directory on the data filesystem instead
+export TMPDIR="$NEO_DATA/tmp/pairs-${SLURM_JOB_ID:-$$}"
+mkdir -p "$TMPDIR"
+trap 'rm -rf "$TMPDIR"' EXIT
+df -h /tmp "$NEO_DATA" | sed 's/^/disk: /'
 
 uv run python -m neo.preprocess.pairs \
   --lr-dir "$NEO_DATA/rubin/dp2" \
@@ -30,7 +39,7 @@ uv run python -m neo.preprocess.pairs \
   --out "$PAIRS" \
   --split sky --val-frac "${VAL_FRAC:-0.2}" --val-period 10 --guard 6 \
   --train-density "${TRAIN_DENSITY:-4}" --val-tile --seed "${SEED:-0}" \
-  --parallel "${SLURM_CPUS_PER_TASK:-8}"
+  --parallel "${SLURM_CPUS_PER_TASK:-8}" --resume
 
 uv run python -m neo.preprocess.leakage --pairs "$PAIRS" --margin 5 --apply
 uv run python -m neo.preprocess.leakage --pairs "$PAIRS" --margin 5   # must report no leakage

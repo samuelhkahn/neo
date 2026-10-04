@@ -14,11 +14,17 @@ Train/val split (--split):
 Window counts: --train-density D samples about D windows per train pixel (coverage ~1 - e^-D);
 --val-tile packs non-overlapping val windows (every val source appears once). Without them,
 --per-patch random windows are split by --val-frac.
+
+Each LR image draws its windows from its own seed (--seed and the file name) and leaves a marker in
+<out>/.done/ when finished, so --resume continues an interrupted run exactly: finished images are
+skipped, a half-written one is cleared and redone, and the settings must match the first run's.
 """
 
 import argparse
+import json
 import time
 import warnings
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -304,6 +310,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--block-size", type=int, default=2048, help="reproject block size")
     parser.add_argument("--parallel", type=int, default=0, help="reproject worker processes")
     parser.add_argument("--dry-run", action="store_true", help="report overlap, write nothing")
+    parser.add_argument(
+        "--resume", action="store_true", help="continue an interrupted run into the same --out"
+    )
     return parser.parse_args(argv)
 
 
@@ -332,19 +341,58 @@ def main(argv=None) -> None:
         )
         return
 
+    done_dir = out / ".done"
+    settings = {
+        k: getattr(args, k)
+        for k in (
+            "lr_size",
+            "factor",
+            "per_patch",
+            "val_frac",
+            "seed",
+            "reject",
+            "split",
+            "val_period",
+            "guard",
+            "train_density",
+            "val_tile",
+            "hr_zeropoint",
+        )
+    }
+    settings["hr_mosaic"] = sorted(Path(m).name for m in args.hr_mosaic)
     dirs = [out / s / k for s in SPLITS for k in ("lr", "hr")]
     stale = [d for d in dirs if any(d.glob("*.fits"))]
-    if stale:
+    if (done_dir / "settings.json").exists():
+        previous = json.loads((done_dir / "settings.json").read_text())
+        if not args.resume:
+            raise SystemExit(f"{out} holds an earlier run; pass --resume or delete it first")
+        if previous != settings:
+            changed = sorted(k for k in settings if previous.get(k) != settings[k])
+            raise SystemExit(f"cannot resume {out}: settings differ from its first run ({changed})")
+    elif stale:
         raise SystemExit(
-            f"{out} already holds pairs ({stale[0]}); move or delete it first, so cutouts from an "
-            "earlier run (possibly another split) cannot mix into this one"
+            f"{out} already holds pairs ({stale[0]}) with no resume record; move or delete it "
+            "first, so cutouts from an earlier run (possibly another split) cannot mix in"
         )
     for split in SPLITS:
         for kind in ("lr", "hr"):
             (out / split / kind).mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(args.seed)
+    done_dir.mkdir(exist_ok=True)
+    (done_dir / "settings.json").write_text(json.dumps(settings, indent=1))
     totals = {"train": 0, "val": 0}
     for path in lr_paths:
+        marker = done_dir / f"{path.stem}.json"
+        if marker.exists():
+            counts = json.loads(marker.read_text())
+            for split in SPLITS:
+                totals[split] += counts[split]
+            print(f"{path.name}: done earlier ({counts['train']} train + {counts['val']} val)")
+            continue
+        for split in SPLITS:  # clear what an interrupted attempt at this image left behind
+            for kind in ("lr", "hr"):
+                for leftover in (out / split / kind).glob(f"{path.stem}_{split}_*.fits"):
+                    leftover.unlink()
+        rng = np.random.default_rng([args.seed, zlib.crc32(path.name.encode())])
         t0 = time.time()
         counts = process_patch(
             path,
@@ -366,6 +414,7 @@ def main(argv=None) -> None:
         )
         for split in SPLITS:
             totals[split] += counts[split]
+        marker.write_text(json.dumps(counts))
         print(
             f"{path.name}: {counts['valid']} valid windows, wrote {counts['train']} train + "
             f"{counts['val']} val ({time.time() - t0:.0f} s)"
