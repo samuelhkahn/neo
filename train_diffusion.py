@@ -23,6 +23,7 @@ from torchvision.transforms import CenterCrop
 from tqdm import tqdm
 
 from neo import diffusion
+from neo.data.augment import train_dataset_class
 from neo.data.collate_fn import collate_fn
 from neo.data.dataset import SR_HST_HSC_Dataset
 from neo.log_figure import log_figure
@@ -155,9 +156,9 @@ def main():
     model_name = f"edm_{identifier}_lr={lr}_crop={crop_size}_ema={ema_decay}"
     print(model_name)
 
-    def make_loader(hst_path, hsc_path):
+    def make_loader(hst_path, hsc_path, dataset_class=SR_HST_HSC_Dataset):
         return torch.utils.data.DataLoader(
-            SR_HST_HSC_Dataset(
+            dataset_class(
                 hst_path=hst_path,
                 hsc_path=hsc_path,
                 hr_size=[hst_dim, hst_dim],
@@ -174,7 +175,10 @@ def main():
             pin_memory=device == "cuda",
         )
 
-    dataloader_train = make_loader(hst_path_train, hsc_path_train)
+    # [DATA_AUG] augment applies to training only (val keeps the centre crop), as in train.py
+    augment, TrainDataset = train_dataset_class(config)
+    experiment.log_parameter("augment", augment)
+    dataloader_train = make_loader(hst_path_train, hsc_path_train, TrainDataset)
     dataloader_val = make_loader(hst_path_val, hsc_path_val)
     val_iter = iter(dataloader_val)
 
