@@ -2,8 +2,18 @@
 
 Each LR image gets an HR grid nested exactly `factor` times finer than its own pixels, and every
 HR mosaic tile overlapping it is reprojected (flux-conserving) onto that grid, so an LR window and
-its HR counterpart cover the same sky. A band of rows in every LR image is reserved for validation,
-and no window straddles the boundary, so train and val cutouts never share a pixel.
+its HR counterpart cover the same sky.
+
+Train/val split (--split):
+  sky   (default) global declination stripes: val is the first --val-frac of every --val-period
+        arcmin in Dec, train is everything else farther than --guard arcsec from val. Overlapping
+        LSST patches and tracts agree on every pixel's split, so no sky is shared between train
+        and val (neo.preprocess.leakage verifies this on the written cutouts).
+  rows  (legacy) the bottom rows of each LSST image are val. Patches overlap their neighbours by
+        300 px, so this shares sky between one patch's val and the next patch's train.
+Window counts: --train-density D samples about D windows per train pixel (coverage ~1 - e^-D);
+--val-tile packs non-overlapping val windows (every val source appears once). Without them,
+--per-patch random windows are split by --val-frac.
 """
 
 import argparse
@@ -15,8 +25,9 @@ import numpy as np
 from astropy.io import fits
 from astropy.utils.exceptions import AstropyWarning
 from astropy.wcs import WCS
+from astropy.wcs.utils import proj_plane_pixel_scales
 from reproject import reproject_adaptive
-from scipy.ndimage import binary_erosion
+from scipy.ndimage import binary_erosion, distance_transform_edt
 
 from neo.preprocess.grid import lr_window_mask, upsampled_wcs
 from neo.surveys.hst.mosaic import MosaicSet
@@ -123,6 +134,53 @@ def split_masks(ok: np.ndarray, val_frac: float) -> dict[str, np.ndarray]:
     return {"train": train, "val": val}
 
 
+def sky_split_masks(
+    ok: np.ndarray, wcs: WCS, val_frac: float, period_arcmin: float, guard_arcsec: float
+) -> dict[str, np.ndarray]:
+    """Split by global Dec stripes: val where Dec (arcmin) mod period < val_frac * period; train
+    where the pixel is at least guard_arcsec (edge to edge) from any val pixel of any image.
+
+    The stripes are computed a guard's width beyond the image, so val sky just outside it still
+    pushes train windows away.
+    """
+    ny, nx = ok.shape
+    celestial = wcs.celestial
+    scale = float(np.mean(proj_plane_pixel_scales(celestial))) * 3600
+    guard = guard_arcsec / scale
+    g = int(np.ceil(guard)) + 2
+    val = np.zeros((ny + 2 * g, nx + 2 * g), bool)
+    xs = np.arange(-g, nx + g)
+    for r0 in range(0, ny + 2 * g, 256):
+        ys = np.arange(r0, min(r0 + 256, ny + 2 * g)) - g
+        xx, yy = np.meshgrid(xs, ys)
+        _, dec = celestial.pixel_to_world_values(xx, yy)
+        val[r0 : r0 + len(ys)] = np.mod(dec * 60 / period_arcmin, 1.0) < val_frac
+    # Centre-to-centre distance d leaves d - 1 px between pixel edges in this grid; one more pixel
+    # covers images on other grids (neighbouring patches, tracts), whose val pixels can poke up to
+    # half a pixel past the stripe edge. So train and val stay >= guard apart on the sky.
+    near_val = distance_transform_edt(~val) < guard + 2
+    inner = (slice(g, g + ny), slice(g, g + nx))
+    return {"train": ok & ~near_val[inner], "val": ok & val[inner]}
+
+
+def tile_windows(ok: np.ndarray, size: int) -> list[tuple[int, int]]:
+    """Top-left corners of non-overlapping, fully valid windows, packed greedily in raster order."""
+    free = full_window_corners(ok, size)
+    if free.size == 0:
+        return []
+    flat = free.ravel()
+    nx = free.shape[1]
+    corners, start = [], 0
+    while True:
+        idx = start + int(np.argmax(flat[start:]))
+        if not flat[idx]:
+            return corners
+        y, x = divmod(idx, nx)
+        corners.append((y, x))
+        free[max(0, y - size + 1) : y + size, max(0, x - size + 1) : x + size] = False
+        start = idx
+
+
 def cutout_hdu(data, wcs, y0, x0, cards) -> fits.PrimaryHDU:
     ny, nx = data.shape
     hdu = fits.PrimaryHDU(data=data, header=wcs[y0 : y0 + ny, x0 : x0 + nx].to_header())
@@ -131,7 +189,22 @@ def cutout_hdu(data, wcs, y0, x0, cards) -> fits.PrimaryHDU:
 
 
 def process_patch(
-    lr_path, mosaic, out, size, factor, per_patch, rng, reject, block_size, val_frac, parallel=False
+    lr_path,
+    mosaic,
+    out,
+    size,
+    factor,
+    per_patch,
+    rng,
+    reject,
+    block_size,
+    val_frac,
+    parallel=False,
+    split_mode="rows",
+    val_period=10.0,
+    guard=6.0,
+    train_density=None,
+    val_tile=False,
 ):
     counts = {"train": 0, "val": 0, "valid": 0}
     coadd = load_coadd(lr_path)
@@ -153,8 +226,18 @@ def process_patch(
 
     n_train = int(round(per_patch * (1 - val_frac)))
     wanted = {"train": n_train, "val": per_patch - n_train}
-    for split, mask in split_masks(ok, val_frac).items():
-        corners, _ = sample_windows(mask, size, wanted[split], rng)
+    if split_mode == "sky":
+        masks = sky_split_masks(ok, sub_wcs, val_frac, val_period, guard)
+    else:
+        masks = split_masks(ok, val_frac)
+    for split, mask in masks.items():
+        if split == "val" and val_tile:
+            corners = tile_windows(mask, size)
+        elif split == "train" and train_density:
+            n = int(np.ceil(train_density * mask.sum() / size**2))
+            corners, _ = sample_windows(mask, size, n, rng)
+        else:
+            corners, _ = sample_windows(mask, size, wanted[split], rng)
         for k, (cy, cx) in enumerate(corners):
             ly, lx = y0 + cy, x0 + cx
             lr_cut = coadd.image[ly : ly + size, lx : lx + size]
@@ -196,7 +279,20 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--lr-size", type=int, default=142, help="LR cutout size in pixels")
     parser.add_argument("--factor", type=int, default=6, help="HR/LR pixel scale ratio")
     parser.add_argument("--per-patch", type=int, default=200, help="cutouts per LR image")
-    parser.add_argument("--val-frac", type=float, default=0.2, help="fraction of rows held out")
+    parser.add_argument("--val-frac", type=float, default=0.2, help="fraction of sky held out")
+    parser.add_argument(
+        "--split", choices=["sky", "rows"], default="sky", help="train/val split (module docstring)"
+    )
+    parser.add_argument("--val-period", type=float, default=10.0, help="Dec stripe period, arcmin")
+    parser.add_argument(
+        "--guard", type=float, default=6.0, help="arcsec of sky kept clear between train and val"
+    )
+    parser.add_argument(
+        "--train-density", type=float, help="train windows per train pixel (overrides --per-patch)"
+    )
+    parser.add_argument(
+        "--val-tile", action="store_true", help="pack non-overlapping val windows (not --per-patch)"
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--reject",
@@ -236,6 +332,13 @@ def main(argv=None) -> None:
         )
         return
 
+    dirs = [out / s / k for s in SPLITS for k in ("lr", "hr")]
+    stale = [d for d in dirs if any(d.glob("*.fits"))]
+    if stale:
+        raise SystemExit(
+            f"{out} already holds pairs ({stale[0]}); move or delete it first, so cutouts from an "
+            "earlier run (possibly another split) cannot mix into this one"
+        )
     for split in SPLITS:
         for kind in ("lr", "hr"):
             (out / split / kind).mkdir(parents=True, exist_ok=True)
@@ -255,6 +358,11 @@ def main(argv=None) -> None:
             args.block_size,
             args.val_frac,
             args.parallel or False,
+            split_mode=args.split,
+            val_period=args.val_period,
+            guard=args.guard,
+            train_density=args.train_density,
+            val_tile=args.val_tile,
         )
         for split in SPLITS:
             totals[split] += counts[split]
