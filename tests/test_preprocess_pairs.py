@@ -1,6 +1,7 @@
 import glob
 
 import numpy as np
+import pytest
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
@@ -305,3 +306,63 @@ def test_main_refuses_to_mix_with_existing_pairs(tmp_path):
                 str(tmp_path / "pairs"),
             ]
         )
+
+
+def write_scene(tmp_path, names=("deep_coadd_1_1_i", "deep_coadd_1_2_i")):
+    lr_wcs = make_tan_wcs(0.2, (60, 60))
+    center = lr_wcs.pixel_to_world(29.5, 29.5)
+    hr_wcs = make_tan_wcs(0.03, (420, 420), crval=(center.ra.deg, center.dec.deg))
+    (tmp_path / "lr").mkdir()
+    for k, name in enumerate(names):
+        data = np.random.default_rng(k).normal(size=(60, 60)).astype(np.float32)
+        image = fits.ImageHDU(data, header=lr_wcs.to_header(), name="IMAGE")
+        image.header["BUNIT"] = "nJy"
+        mask = fits.ImageHDU(np.zeros((60, 60), np.int32), name="MASK")
+        mask.header["MSKN0000"], mask.header["MSKM0000"] = "NO_DATA", 1
+        mask.header["MSKN0001"], mask.header["MSKM0001"] = "SATURATED", 2
+        fits.HDUList([fits.PrimaryHDU(), image, mask]).writeto(tmp_path / "lr" / f"{name}.fits")
+    write_mosaic(tmp_path / "mosaic.fits", np.full((420, 420), 2.0, np.float32), hr_wcs)
+
+
+def run_pairs(tmp_path, out, *extra):
+    pairs.main(
+        [
+            "--lr-dir", str(tmp_path / "lr"), "--hr-mosaic", str(tmp_path / "mosaic.fits"),
+            "--out", str(out), "--lr-size", "4", "--block-size", "128", "--split", "sky",
+            "--val-frac", "0.3", "--val-period", "0.1", "--guard", "0.2",
+            "--train-density", "2", "--val-tile", *extra,
+        ]
+    )  # fmt: skip
+
+
+def snapshot(out):
+    return {
+        str(p.relative_to(out)): fits.getdata(p).tobytes() for p in sorted(out.glob("*/*/*.fits"))
+    }
+
+
+def test_resume_reproduces_an_uninterrupted_run(tmp_path):
+    write_scene(tmp_path)
+    run_pairs(tmp_path, tmp_path / "full")
+    full = snapshot(tmp_path / "full")
+    assert any("1_1" in k for k in full) and any("1_2" in k for k in full)
+
+    # interrupted run: the second image never finished and left a stray file behind
+    run_pairs(tmp_path, tmp_path / "cut")
+    cut = tmp_path / "cut"
+    (cut / ".done" / "deep_coadd_1_2_i.json").unlink()
+    for p in cut.glob("*/*/deep_coadd_1_2_i_*.fits"):
+        p.unlink()
+    stray = cut / "train" / "lr" / "deep_coadd_1_2_i_train_99999.fits"
+    fits.PrimaryHDU(np.zeros((4, 4), np.float32)).writeto(stray)
+    with pytest.raises(SystemExit, match="--resume"):
+        run_pairs(tmp_path, cut)
+    run_pairs(tmp_path, cut, "--resume")
+    assert snapshot(cut) == full and not stray.exists()
+
+
+def test_resume_refuses_changed_settings(tmp_path):
+    write_scene(tmp_path, names=("deep_coadd_1_1_i",))
+    run_pairs(tmp_path, tmp_path / "out")
+    with pytest.raises(SystemExit, match="guard"):
+        run_pairs(tmp_path, tmp_path / "out", "--resume", "--guard", "0.4")
