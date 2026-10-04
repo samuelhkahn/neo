@@ -22,6 +22,7 @@ from comet_ml import Experiment, OfflineExperiment
 from torchvision.transforms import CenterCrop
 from tqdm import tqdm
 
+from neo.data.augment import train_dataset_class
 from neo.data.collate_fn import collate_fn
 from neo.data.dataset import SR_HST_HSC_Dataset
 from neo.log_figure import log_figure
@@ -145,9 +146,11 @@ def main():
     )
     print(model_name)
 
-    # Create dataloaders
+    # Create dataloaders; [DATA_AUG] augment applies to training only (val keeps the centre crop)
+    augment, TrainDataset = train_dataset_class(config)
+    experiment.log_parameter("augment", augment)
     dataloader_train = torch.utils.data.DataLoader(
-        SR_HST_HSC_Dataset(
+        TrainDataset(
             hst_path=hst_path_train, hsc_path=hsc_path_train,
             hr_size=[hst_dim, hst_dim], lr_size=[hsc_dim, hsc_dim],
             transform_type="ds9_scale", data_aug=data_aug, experiment=None,
