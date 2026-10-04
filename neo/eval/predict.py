@@ -4,8 +4,16 @@ Inputs go through the training dataset class unchanged (center crop -> clip -> l
 no augmentation), so every model sees exactly what it was trained on. Outputs are cropped to the
 central 600 px and inverse log-scaled (neo.eval.postprocess.to_physical), then written as
 <out>/<pair name>.fits with the HR cutout's WCS. predictions.csv records the log-space L1 against
-the HR target over the same 600 px region (a cheap checkpoint-selection proxy). The run is tracked
-on Comet (neo.eval.tracking): parameters, the config, per-pair L1, example images, predictions.csv.
+the HR target over the same 600 px region.
+
+--subset select|report|all (neo.eval.subsets) picks which val pairs to predict. Score candidate
+checkpoints on select only (their L1 here, or compare.py --subset select); predict report only
+for the chosen checkpoint, so the reported numbers never influence the choice.
+
+Each output records its checkpoint (NEORUN, NEOCKPT, NEOSTEP) and sky (PAIRID). An existing file
+is reused only when all of those match; anything else stops the run unless --overwrite is given,
+so predictions from another checkpoint or pairs build cannot be mixed in. The run is tracked on
+Comet (neo.eval.tracking): parameters, the config, per-pair L1, example images, predictions.csv.
 """
 
 import argparse
@@ -26,6 +34,7 @@ from astropy.wcs import WCS  # noqa: E402
 from neo.data.dataset import SR_HST_HSC_Dataset  # noqa: E402
 from neo.eval.postprocess import HR_SIZE, LR_SIZE, center_crop, to_physical  # noqa: E402
 from neo.eval.predictors import build_predictor  # noqa: E402
+from neo.eval.subsets import SUBSETS, in_subset, load_groups, pair_id  # noqa: E402
 from neo.eval.tracking import start_experiment  # noqa: E402
 from neo.models.registry import generator_name  # noqa: E402
 
@@ -80,7 +89,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         default="eval",
         help="GAN generator mode at inference (train keeps dropout/batch-stat BatchNorm)",
     )
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--subset", choices=SUBSETS, default="all", help="val pairs to predict (module docstring)"
+    )
+    parser.add_argument("--overwrite", action="store_true", help="replace existing predictions")
     parser.add_argument("--tag", action="append", default=[], help="extra Comet tag (repeatable)")
     parser.add_argument("--no-comet", action="store_true", help="do not track the run on Comet")
     return parser.parse_args(argv)
@@ -88,6 +100,8 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def main(argv=None) -> None:
     args = parse_args(argv)
+    if args.gen_mode == "train" and args.batch_size != 1:
+        raise SystemExit("--gen-mode train uses batch statistics: use --batch-size 1")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = pick_device(args.device)
@@ -104,7 +118,9 @@ def main(argv=None) -> None:
         data_aug=False,
         experiment=None,
     )
-    order = sorted(range(len(dataset)), key=lambda i: dataset.filenames[i])[: args.limit]
+    groups = load_groups(split)
+    order = sorted(range(len(dataset)), key=lambda i: dataset.filenames[i])
+    order = [i for i in order if in_subset(dataset.filenames[i], args.subset, groups)][: args.limit]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     predict = build_predictor(config, args.checkpoint, device, mode=args.gen_mode)
@@ -113,21 +129,25 @@ def main(argv=None) -> None:
     model = generator_name(config)
     identifier = config.get("IDENTIFIER", "identifier", fallback="").strip('"')
     checkpoint = Path(args.checkpoint)
+    state = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
+    step = int(state.get("step", -1))
+    del state
+    source = {"NEORUN": checkpoint.parent.name, "NEOCKPT": checkpoint.name, "NEOSTEP": step}
     experiment = None
     if not args.no_comet:
         experiment = start_experiment(
-            f"predict {identifier or model} {checkpoint.stem} {split.name}",
-            ["predict", model, *args.tag],
+            f"predict {identifier or model} {checkpoint.stem} {split.name}-{args.subset}",
+            ["predict", model, args.subset, *args.tag],
         )
-        state = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
         experiment.log_parameters(
             {
                 "generator": model,
                 "identifier": identifier,
                 "config": args.config,
                 "checkpoint": str(checkpoint.resolve()),
-                "checkpoint_step": state.get("step"),
+                "checkpoint_step": step,
                 "split_dir": str(split.resolve()),
+                "subset": args.subset,
                 "out": str(out.resolve()),
                 "n_pairs": len(order),
                 "batch_size": args.batch_size,
@@ -136,7 +156,6 @@ def main(argv=None) -> None:
                 "device": device,
             }
         )
-        del state
         experiment.log_asset(args.config)
 
     rows, t0 = [], time.time()
@@ -144,7 +163,15 @@ def main(argv=None) -> None:
         batch = []
         for i in order[start : start + args.batch_size]:
             name = dataset.filenames[i]
+            expected = {**source, "PAIRID": pair_id(fits.getheader(split / "hr" / name))}
             if (out / name).exists() and not args.overwrite:
+                header = fits.getheader(out / name)
+                differs = {k: header.get(k) for k, v in expected.items() if header.get(k) != v}
+                if differs:
+                    raise SystemExit(
+                        f"{out / name} exists but came from {differs}, not {expected}: predict "
+                        "into a new --out (or pass --overwrite)"
+                    )
                 continue
             hst, hsc, hsc_hr, _ = dataset[i]
             if hst is None:
@@ -160,8 +187,8 @@ def main(argv=None) -> None:
             l1 = float(np.mean(np.abs(center_crop(p, HR_SIZE) - center_crop(hst.numpy(), HR_SIZE))))
             header = cropped_wcs_header(split / "hr" / name, HR_SIZE)
             header["BUNIT"] = fits.getheader(split / "hr" / name).get("BUNIT", "")
-            header["NEOCKPT"] = checkpoint.name
-            header["NEORUN"] = checkpoint.parent.name
+            header.update(source)
+            header["PAIRID"] = pair_id(fits.getheader(split / "hr" / name))
             header["L1LOG"] = l1
             fits.PrimaryHDU(to_physical(p).astype(np.float32), header=header).writeto(
                 out / name, overwrite=True

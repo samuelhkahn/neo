@@ -44,25 +44,10 @@ from neo.eval.postprocess import (  # noqa: E402
     center_crop,
     subtract_background,
 )
+from neo.eval.subsets import in_subset, load_groups, pair_id  # noqa: E402,F401
 from neo.eval.tracking import start_experiment  # noqa: E402
 
 LR_KEY = "lr"
-
-
-def load_groups(split: Path) -> dict:
-    path = split / "groups.csv"
-    if not path.exists():
-        return {}
-    with open(path, newline="") as f:
-        return {row["name"]: row["group"] for row in csv.DictReader(f)}
-
-
-def in_subset(name: str, subset: str, groups=None) -> bool:
-    if subset == "all":
-        return True
-    key = (groups or {}).get(name, name)
-    selected = int(hashlib.md5(key.encode()).hexdigest(), 16) % 5 == 0
-    return selected if subset == "select" else not selected
 
 
 def threshold_for(hr_path: Path, override, nsigma, hst) -> float:
@@ -148,14 +133,47 @@ def bias_figure(table4, title):
     return fig
 
 
-def checkpoint_of(directory: Path, name: str) -> str:
-    """Run/checkpoint recorded by predict.py in a prediction's header."""
-    header = fits.getheader(directory / name)
-    return "/".join(str(header[k]) for k in ("NEORUN", "NEOCKPT") if k in header)
+def verify_predictions(split: Path, preds: dict, names: list) -> dict:
+    """Each prediction must show its HR cutout's sky, and each directory hold one checkpoint.
+
+    Returns {model: "run/checkpoint/step"}. Stops on predictions from another pairs build or a
+    directory mixing checkpoints, which would otherwise be scored against the wrong cutouts.
+    """
+    checkpoints = {}
+    for model, directory in preds.items():
+        seen = set()
+        for name in names:
+            header = fits.getheader(directory / name)
+            expected = pair_id(fits.getheader(split / "hr" / name))
+            if header.get("PAIRID") != expected:
+                raise SystemExit(
+                    f"{directory / name} shows {header.get('PAIRID')!r} but {split / 'hr' / name} "
+                    f"is {expected!r}: predictions from another pairs build? Re-run predict.py."
+                )
+            seen.add(tuple(str(header.get(k)) for k in ("NEORUN", "NEOCKPT", "NEOSTEP")))
+        if len(seen) != 1:
+            raise SystemExit(
+                f"{directory} mixes predictions from several checkpoints: {sorted(seen)}"
+            )
+        checkpoints[model] = "/".join(seen.pop())
+    return checkpoints
 
 
 def track(
-    args, split, preds, names, kept, rows, elongated, table4, gains, pairwise, out, fig, groups
+    args,
+    split,
+    preds,
+    names,
+    kept,
+    rows,
+    elongated,
+    table4,
+    gains,
+    pairwise,
+    out,
+    fig,
+    groups,
+    checkpoints,
 ):
     experiment = start_experiment(
         f"compare {split.name}-{args.subset}: {' vs '.join(preds)}",
@@ -179,7 +197,7 @@ def track(
             "n_sources_orientation": int(elongated.sum()),
             "out": str(out.resolve()),
             **{f"pred_dir/{m}": str(d.resolve()) for m, d in preds.items()},
-            **{f"checkpoint/{m}": checkpoint_of(d, names[0]) for m, d in preds.items()},
+            **{f"checkpoint/{m}": c for m, c in checkpoints.items()},
         }
     )
     for entry in table4:
@@ -254,6 +272,9 @@ def main(argv=None) -> None:
     names = [n for n in names if all((d / n).exists() for d in preds.values())][: args.limit]
     if not names:
         raise SystemExit("no pairs predicted by every model in this subset")
+    checkpoints = verify_predictions(split, preds, names)
+    for model, checkpoint in checkpoints.items():
+        print(f"  {model}: {checkpoint}")
     opts = {
         "factor": args.factor,
         "npixels": args.npixels,
@@ -395,6 +416,7 @@ def main(argv=None) -> None:
             out,
             fig,
             groups,
+            checkpoints,
         )
     plt.close(fig)
     print(f"\nreport written to {out}")
