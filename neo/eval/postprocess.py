@@ -1,0 +1,65 @@
+"""Turn a model's output back into a physical image; identical for every model under comparison.
+
+Inverse of the training preprocessing in neo.data.dataset (center crop -> clip -> log scale -> pad):
+the 768 px output is cropped to its central 600 px (the 84 px reflection pad is removed) and the
+fixed log scaling (alpha = 1000, b = 1) is inverted, giving the HR image in the pairs' units (nJy).
+"""
+
+import numpy as np
+import sep
+
+from neo.data.dataset import SR_HST_HSC_Dataset
+
+HR_SIZE = 600  # dataset center-crops HR cutouts to 600 px and pads to 768
+LR_SIZE = 100  # and LR cutouts to 100 px, padded to 128
+LOG_SCALE_A = 1000
+LOG_SCALE_OFFSET = 1
+
+
+def center_crop(a: np.ndarray, size: int) -> np.ndarray:
+    y0 = (a.shape[-2] - size) // 2
+    x0 = (a.shape[-1] - size) // 2
+    return a[..., y0 : y0 + size, x0 : x0 + size]
+
+
+def to_physical(output: np.ndarray) -> np.ndarray:
+    """(…, 768, 768) model output in log space -> (…, 600, 600) image in the HR pair units."""
+    cropped = center_crop(np.asarray(output, dtype=np.float64), HR_SIZE)
+    return SR_HST_HSC_Dataset.ds9_unscaling(cropped, a=LOG_SCALE_A, offset=LOG_SCALE_OFFSET)
+
+
+def subtract_background(image: np.ndarray) -> np.ndarray:
+    """SEP mesh background subtraction (default 64 px mesh), as applied before cataloging."""
+    data = np.ascontiguousarray(image, dtype=np.float64)
+    return data - sep.Background(data).back()
+
+
+def balance_noise(
+    image: np.ndarray, tolerance: float = 0.1, rng=None, max_iter: int = 100
+) -> np.ndarray:
+    """Refill exact zeros with negated positive noise samples.
+
+    Port of `balance_noise` (paper repo, figure_scripts/segmap_photometry/catalog_matching.ipynb):
+    clipping at zero during preprocessing removes negative sky noise; this restores it by sampling
+    from the iteratively sigma-clipped positive noise and flipping the sign. The original compared
+    every iteration's std with the *initial* std and so never terminated unless the first clip was
+    already within tolerance; here the clip iterates until the std converges (max_iter cap).
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    image = np.array(image, dtype=np.float64)
+    pixel_vals = image.flatten()
+    mask = np.ones_like(pixel_vals, dtype=bool)
+    curr_std = np.std(image)
+    for _ in range(max_iter):
+        masked = pixel_vals[mask]
+        new_mask = pixel_vals < 3 * np.std(masked)
+        new_std = np.std(pixel_vals[new_mask])
+        mask = np.logical_and(mask, new_mask)
+        if np.abs(new_std - curr_std) < tolerance:
+            break
+        curr_std = new_std
+    negative_noise_samples = pixel_vals[np.logical_and(mask, pixel_vals > 0)] * -1
+    ys, xs = np.where(image == 0)
+    if len(ys) and len(negative_noise_samples):
+        image[ys, xs] = rng.choice(negative_noise_samples, size=ys.shape)
+    return image

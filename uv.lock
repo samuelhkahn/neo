@@ -974,6 +974,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+eval = [
+    { name = "photutils" },
+    { name = "sep" },
+]
 rubin = [
     { name = "pyvo" },
     { name = "requests" },
@@ -1007,11 +1011,13 @@ requires-dist = [
     { name = "matplotlib", marker = "extra == 'train'", specifier = ">=3.5" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "opencv-python", marker = "extra == 'train'", specifier = ">=4.5" },
+    { name = "photutils", marker = "extra == 'eval'", specifier = ">=2.0,<4" },
     { name = "pyvo", marker = "extra == 'rubin'", specifier = ">=1.5" },
     { name = "reproject", specifier = ">=0.21.0" },
     { name = "requests", marker = "extra == 'rubin'", specifier = ">=2.31" },
     { name = "scikit-image", marker = "extra == 'train'", specifier = ">=0.19" },
     { name = "scikit-learn", marker = "extra == 'train'", specifier = ">=1.0" },
+    { name = "sep", marker = "extra == 'eval'", specifier = ">=1.2" },
     { name = "sep", marker = "extra == 'train'", specifier = ">=1.2" },
     { name = "torch", marker = "sys_platform == 'linux' and extra == 'train'", specifier = "==2.6.0", index = "https://download.pytorch.org/whl/cu124" },
     { name = "torch", marker = "sys_platform != 'linux' and extra == 'train'", specifier = ">=2.6" },
@@ -1019,7 +1025,7 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform != 'linux' and extra == 'train'", specifier = ">=0.21" },
     { name = "tqdm", marker = "extra == 'train'", specifier = ">=4.62" },
 ]
-provides-extras = ["rubin", "train"]
+provides-extras = ["rubin", "train", "eval"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1297,6 +1303,25 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/b2/3a/3f06f34820a31257ddcabdfafc2672c5816be79c7e353b02c1f318daa7d4/partd-1.4.2.tar.gz", hash = "sha256:d022c33afbdc8405c226621b015e8067888173d85f7f5ecebb3cafed9a20f02c", size = 21029, upload-time = "2024-05-06T19:51:41.945Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/71/e7/40fb618334dcdf7c5a316c0e7343c5cd82d3d866edc100d98e29bc945ecd/partd-1.4.2-py3-none-any.whl", hash = "sha256:978e4ac767ec4ba5b86c6eaa52e5a2a3bc748a2ca839e8cc798f1cc6ce6efb0f", size = 18905, upload-time = "2024-05-06T19:51:39.271Z" },
+]
+
+[[package]]
+name = "photutils"
+version = "3.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "astropy" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+    { name = "scipy", version = "1.16.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2c/54/9eb5c73edb7fe3b911af0c64e8022f5b629444e34816a975bd0efa60b758/photutils-3.0.0.tar.gz", hash = "sha256:5e1ca2be9433e1e1f9f6d477e1e6c8029755caceefb4e349048955e3cb825529", size = 969607, upload-time = "2026-04-17T22:14:25.206Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/61/38/48ed724a8c49eb0dac8a636913092ace4b31da356e2ee8fb0f0b0ff89c08/photutils-3.0.0-cp311-abi3-macosx_10_9_x86_64.whl", hash = "sha256:60767e0bc8ef963561a73252c878b9348450cab0a1a1a85729f621410cc4a395", size = 1041439, upload-time = "2026-04-17T22:14:19.668Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/c3/6d336daae0c0406e586183ce3f1f3ba97f78344574be5883c6ae6f184efa/photutils-3.0.0-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:1faa9da37a2fb46c2ef527bf2bba00df268553635758032497163ef2c5e83c4a", size = 1044718, upload-time = "2026-04-17T22:14:21.145Z" },
+    { url = "https://files.pythonhosted.org/packages/23/6b/d4bd67d23c0ca12f5307ee12edca7c5e1d4da7747ab67322d5e65c476c07/photutils-3.0.0-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6e0ccb7361144f8f220c8d852c01678661bc7ed5a1e1378b39c8bf78a479efc4", size = 1766023, upload-time = "2026-04-17T22:14:22.78Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/ab/067fedf9c63cd8c80ad4ced4935189590b7a35dc0f3196f5a50c5a951eb1/photutils-3.0.0-cp311-abi3-win_amd64.whl", hash = "sha256:112ab07628f0b1d8bb6e70c926279a867e6bb57eea82f8141410b155a00e73d1", size = 1052065, upload-time = "2026-04-17T22:14:24.044Z" },
 ]
 
 [[package]]

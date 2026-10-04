@@ -30,6 +30,10 @@ train = [
     "torchvision==0.21.0; sys_platform == 'linux'",
     "tqdm>=4.62",
 ]
+eval = [
+    "photutils>=2.0,<4",
+    "sep>=1.2",
+]
 
 [dependency-groups]
 dev = [
