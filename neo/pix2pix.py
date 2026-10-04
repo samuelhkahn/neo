@@ -50,18 +50,20 @@ class Pix2Pix:
                  learning_rate=0.0002, disc_learning_rate=0.0002,
                  lambda_recon=200, lambda_segmap=200, lambda_vgg=200,
                  lambda_adv=5, display_step=25,
-                 pretrained_generator="", pretrained_discriminator=""):
+                 pretrained_generator="", pretrained_discriminator="", generator=None):
 
         super().__init__()
 
         self.device = device
         self.display_step = display_step
 
-        # Initialize generator
+        # Initialize generator (a drop-in replacement for the NEO U-Net may be passed in)
         if pretrained_generator:
             print(f"Loading Pretrained Generator: {pretrained_generator}")
             path = os.path.join(os.getcwd(), "models", pretrained_generator)
             self.gen = torch.load(path, weights_only=False)
+        elif generator is not None:
+            self.gen = generator
         else:
             self.gen = Pix2PixGenerator(in_channels, out_channels)
 

@@ -25,6 +25,7 @@ from tqdm import tqdm
 from neo.data.collate_fn import collate_fn
 from neo.data.dataset import SR_HST_HSC_Dataset
 from neo.log_figure import log_figure
+from neo.models.registry import generator_name, make_generator
 from neo.pix2pix import Pix2Pix
 
 
@@ -177,7 +178,9 @@ def main():
             val_iter = iter(dataloader_val)
             return next(val_iter)
 
-    # Initialize model
+    # Initialize model; [MODEL] generator swaps in a different generator (default: the NEO U-Net)
+    gen_name = generator_name(config)
+    experiment.log_parameter("generator", gen_name)
     pix2pix = Pix2Pix(
         in_channels=1, out_channels=1, device=device,
         learning_rate=lr, disc_learning_rate=disc_lr,
@@ -186,7 +189,11 @@ def main():
         lambda_adv=lambda_adv,
         display_step=display_step, pretrained_generator=pretrained_generator,
         pretrained_discriminator=pretrained_discriminator,
+        generator=None if gen_name == "neo" else make_generator(config),
     )
+    n_params = sum(p.numel() for p in pix2pix.gen.parameters())
+    print(f"generator: {gen_name} ({n_params / 1e6:.1f} M parameters)")
+    experiment.log_parameter("generator_params", n_params)
 
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     cur_step = 0
