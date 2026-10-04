@@ -11,8 +11,10 @@ LR cutout (central 100 px, segmap reprojected to the coarse grid). Writes:
   table4.png   median bias with 95% CI per parameter and image set
 All of it, with the run's parameters and each model's checkpoint, is tracked on Comet.
 
---subset select|report|all splits pairs deterministically by name (20% select / 80% report), so
-checkpoint selection and the reported numbers never use the same pairs.
+--subset select|report|all splits pairs deterministically (20% select / 80% report), so checkpoint
+selection and the reported numbers never use the same pairs. With <split>/groups.csv (written by
+neo.preprocess.leakage) whole groups of overlapping cutouts are assigned together, so the two
+subsets share no sky; without it, pairs are assigned by name.
 """
 
 import argparse
@@ -47,10 +49,19 @@ from neo.eval.tracking import start_experiment  # noqa: E402
 LR_KEY = "lr"
 
 
-def in_subset(name: str, subset: str) -> bool:
+def load_groups(split: Path) -> dict:
+    path = split / "groups.csv"
+    if not path.exists():
+        return {}
+    with open(path, newline="") as f:
+        return {row["name"]: row["group"] for row in csv.DictReader(f)}
+
+
+def in_subset(name: str, subset: str, groups=None) -> bool:
     if subset == "all":
         return True
-    selected = int(hashlib.md5(name.encode()).hexdigest(), 16) % 5 == 0
+    key = (groups or {}).get(name, name)
+    selected = int(hashlib.md5(key.encode()).hexdigest(), 16) % 5 == 0
     return selected if subset == "select" else not selected
 
 
@@ -143,7 +154,9 @@ def checkpoint_of(directory: Path, name: str) -> str:
     return "/".join(str(header[k]) for k in ("NEORUN", "NEOCKPT") if k in header)
 
 
-def track(args, split, preds, names, kept, rows, elongated, table4, gains, pairwise, out, fig):
+def track(
+    args, split, preds, names, kept, rows, elongated, table4, gains, pairwise, out, fig, groups
+):
     experiment = start_experiment(
         f"compare {split.name}-{args.subset}: {' vs '.join(preds)}",
         ["comparison", args.subset, *preds, *args.tag],
@@ -152,6 +165,7 @@ def track(args, split, preds, names, kept, rows, elongated, table4, gains, pairw
         {
             "split_dir": str(split.resolve()),
             "subset": args.subset,
+            "subset_by": "sky group" if groups else "name",
             "models": ",".join(preds),
             "factor": args.factor,
             "npixels": args.npixels,
@@ -232,8 +246,11 @@ def main(argv=None) -> None:
         preds[model] = Path(directory)
     if LR_KEY in preds:
         raise SystemExit(f"'{LR_KEY}' is reserved for the low-resolution baseline")
+    groups = load_groups(split)
+    if args.subset != "all" and not groups:
+        print(f"no {split / 'groups.csv'}: assigning {args.subset} by name, not by sky group")
     names = sorted(p.name for p in (split / "hr").glob("*.fits"))
-    names = [n for n in names if in_subset(n, args.subset)]
+    names = [n for n in names if in_subset(n, args.subset, groups)]
     names = [n for n in names if all((d / n).exists() for d in preds.values())][: args.limit]
     if not names:
         raise SystemExit("no pairs predicted by every model in this subset")
@@ -364,7 +381,21 @@ def main(argv=None) -> None:
     fig = bias_figure(table4, f"{split.name} {args.subset}: {kept} sets, {len(rows)} sources")
     fig.savefig(out / "table4.png", dpi=120)
     if not args.no_comet:
-        track(args, split, preds, names, kept, rows, elongated, table4, gains, pairwise, out, fig)
+        track(
+            args,
+            split,
+            preds,
+            names,
+            kept,
+            rows,
+            elongated,
+            table4,
+            gains,
+            pairwise,
+            out,
+            fig,
+            groups,
+        )
     plt.close(fig)
     print(f"\nreport written to {out}")
 
