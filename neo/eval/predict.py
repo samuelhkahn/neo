@@ -4,7 +4,8 @@ Inputs go through the training dataset class unchanged (center crop -> clip -> l
 no augmentation), so every model sees exactly what it was trained on. Outputs are cropped to the
 central 600 px and inverse log-scaled (neo.eval.postprocess.to_physical), then written as
 <out>/<pair name>.fits with the HR cutout's WCS. predictions.csv records the log-space L1 against
-the HR target over the same 600 px region (a cheap checkpoint-selection proxy).
+the HR target over the same 600 px region (a cheap checkpoint-selection proxy). The run is tracked
+on Comet (neo.eval.tracking): parameters, the config, per-pair L1, example images, predictions.csv.
 """
 
 import argparse
@@ -13,14 +14,22 @@ import csv
 import time
 from pathlib import Path
 
-import numpy as np
-import torch
-from astropy.io import fits
-from astropy.wcs import WCS
+import matplotlib
 
-from neo.data.dataset import SR_HST_HSC_Dataset
-from neo.eval.postprocess import HR_SIZE, center_crop, to_physical
-from neo.eval.predictors import build_predictor
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+from astropy.io import fits  # noqa: E402
+from astropy.wcs import WCS  # noqa: E402
+
+from neo.data.dataset import SR_HST_HSC_Dataset  # noqa: E402
+from neo.eval.postprocess import HR_SIZE, LR_SIZE, center_crop, to_physical  # noqa: E402
+from neo.eval.predictors import build_predictor  # noqa: E402
+from neo.eval.tracking import start_experiment  # noqa: E402
+from neo.models.registry import generator_name  # noqa: E402
+
+N_EXAMPLES = 3
 
 
 def pick_device(name: str) -> str:
@@ -40,6 +49,21 @@ def cropped_wcs_header(hr_path: Path, size: int) -> fits.Header:
     return WCS(header)[y0 : y0 + size, x0 : x0 + size].to_header()
 
 
+def example_figure(name, lr, sr, hr):
+    """LR | SR | HST in the training log space, on the HST image's color scale."""
+    panels = [center_crop(lr, LR_SIZE), center_crop(sr, HR_SIZE), center_crop(hr, HR_SIZE)]
+    vmin, vmax = np.percentile(panels[2], [1, 99.8])
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.4))
+    for ax, img, title in zip(axes, panels, ["LR", "SR", "HST"], strict=True):
+        im = ax.imshow(img, origin="lower", cmap="plasma", vmin=vmin, vmax=vmax)
+        ax.set_title(title)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.colorbar(im, ax=axes, shrink=0.8, label="log-scaled flux")
+    fig.suptitle(name)
+    return fig
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", required=True, help="the .ini the model was trained with")
@@ -57,6 +81,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="GAN generator mode at inference (train keeps dropout/batch-stat BatchNorm)",
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--tag", action="append", default=[], help="extra Comet tag (repeatable)")
+    parser.add_argument("--no-comet", action="store_true", help="do not track the run on Comet")
     return parser.parse_args(argv)
 
 
@@ -84,6 +110,35 @@ def main(argv=None) -> None:
     predict = build_predictor(config, args.checkpoint, device, mode=args.gen_mode)
     print(f"device {device} | {len(order)} pairs from {split} -> {out}")
 
+    model = generator_name(config)
+    identifier = config.get("IDENTIFIER", "identifier", fallback="").strip('"')
+    checkpoint = Path(args.checkpoint)
+    experiment = None
+    if not args.no_comet:
+        experiment = start_experiment(
+            f"predict {identifier or model} {checkpoint.stem} {split.name}",
+            ["predict", model, *args.tag],
+        )
+        state = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
+        experiment.log_parameters(
+            {
+                "generator": model,
+                "identifier": identifier,
+                "config": args.config,
+                "checkpoint": str(checkpoint.resolve()),
+                "checkpoint_step": state.get("step"),
+                "split_dir": str(split.resolve()),
+                "out": str(out.resolve()),
+                "n_pairs": len(order),
+                "batch_size": args.batch_size,
+                "seed": args.seed,
+                "gen_mode": args.gen_mode,
+                "device": device,
+            }
+        )
+        del state
+        experiment.log_asset(args.config)
+
     rows, t0 = [], time.time()
     for start in range(0, len(order), args.batch_size):
         batch = []
@@ -101,16 +156,23 @@ def main(argv=None) -> None:
         lr = torch.stack([b[2] for b in batch]).unsqueeze(1)
         cond = torch.stack([b[3] for b in batch]).unsqueeze(1).to(device)
         pred = predict(lr, cond).detach().float().cpu().numpy()[:, 0]
-        for (name, hst, _, _), p in zip(batch, pred, strict=True):
+        for (name, hst, hsc, _), p in zip(batch, pred, strict=True):
             l1 = float(np.mean(np.abs(center_crop(p, HR_SIZE) - center_crop(hst.numpy(), HR_SIZE))))
             header = cropped_wcs_header(split / "hr" / name, HR_SIZE)
             header["BUNIT"] = fits.getheader(split / "hr" / name).get("BUNIT", "")
-            header["NEOCKPT"] = Path(args.checkpoint).name
+            header["NEOCKPT"] = checkpoint.name
+            header["NEORUN"] = checkpoint.parent.name
             header["L1LOG"] = l1
             fits.PrimaryHDU(to_physical(p).astype(np.float32), header=header).writeto(
                 out / name, overwrite=True
             )
             rows.append({"name": name, "l1_log": l1})
+            if experiment is not None:
+                experiment.log_metric("l1_log", l1, step=len(rows))
+                if len(rows) <= N_EXAMPLES:
+                    fig = example_figure(name, hsc.numpy(), p, hst.numpy())
+                    experiment.log_figure(figure_name=f"example {len(rows)}: {name}", figure=fig)
+                    plt.close(fig)
         done = min(start + args.batch_size, len(order))
         print(f"  {done}/{len(order)} ({(time.time() - t0) / done:.2f} s/pair)")
 
@@ -124,6 +186,17 @@ def main(argv=None) -> None:
             writer.writerows(rows)
         mean_l1 = np.mean([r["l1_log"] for r in rows])
         print(f"wrote {len(rows)} predictions; mean log-space L1 {mean_l1:.4f}")
+        if experiment is not None:
+            experiment.log_metrics(
+                {
+                    "mean_l1_log": mean_l1,
+                    "n_written": len(rows),
+                    "s_per_pair": (time.time() - t0) / len(rows),
+                }
+            )
+            experiment.log_table(str(path))
+    if experiment is not None:
+        experiment.end()
 
 
 if __name__ == "__main__":

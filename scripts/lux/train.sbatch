@@ -16,12 +16,13 @@
 # --exclusive takes a whole comp-astro node (2x V100); training uses GPU 0, leaving GPU 1 free for a
 # second config in the same job (CUDA_VISIBLE_DEVICES=1) if you want an ablation alongside.
 # Submit from the repo root:  sbatch scripts/lux/train.sbatch        (CONFIG=... to use another ini)
-# COMET_ML_ASTRO_API_KEY should be exported in ~/.bashrc; without it Comet logs offline.
+# Comet: COMET_ML_ASTRO_API_KEY must be exported when submitting (scripts/lux/comet_check.sh).
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 export PATH="$HOME/.local/bin:$PATH"
 : "${NEO_DATA:?set NEO_DATA}"
 CONFIG="${CONFIG:-neo/configs/lux.ini}"
+source scripts/lux/comet_check.sh
 
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 uv run python train.py "$CONFIG" --resume

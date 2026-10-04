@@ -17,6 +17,7 @@ set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 export PATH="$HOME/.local/bin:$PATH"
 : "${NEO_DATA:?set NEO_DATA}"
+source scripts/lux/comet_check.sh
 SPLIT="${SPLIT:-val}"
 SUBSET="${SUBSET:-report}"
 

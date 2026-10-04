@@ -8,6 +8,8 @@ LR cutout (central 100 px, segmap reprojected to the coarse grid). Writes:
   table4.csv / table4.md   paper Table 4 statistics (median, bootstrap 95% CI, NMAD; mean, std)
   gains.csv    per model: share of sources it improves over the LR image (paper's gain metric)
   pairwise.csv per model pair: share of sources where the first model is closer to HST
+  table4.png   median bias with 95% CI per parameter and image set
+All of it, with the run's parameters and each model's checkpoint, is tracked on Comet.
 
 --subset select|report|all splits pairs deterministically by name (20% select / 80% report), so
 checkpoint selection and the reported numbers never use the same pairs.
@@ -22,14 +24,25 @@ import warnings
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-import numpy as np
-from astropy.io import fits
-from astropy.wcs import WCS
-from astropy.wcs.utils import proj_plane_pixel_scales
+import matplotlib
 
-from neo.eval import metrics
-from neo.eval.catalogs import NPIXELS, catalog_set, default_threshold
-from neo.eval.postprocess import HR_SIZE, LR_SIZE, balance_noise, center_crop, subtract_background
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+from astropy.io import fits  # noqa: E402
+from astropy.wcs import WCS  # noqa: E402
+from astropy.wcs.utils import proj_plane_pixel_scales  # noqa: E402
+
+from neo.eval import metrics  # noqa: E402
+from neo.eval.catalogs import NPIXELS, catalog_set, default_threshold  # noqa: E402
+from neo.eval.postprocess import (  # noqa: E402
+    HR_SIZE,
+    LR_SIZE,
+    balance_noise,
+    center_crop,
+    subtract_background,
+)
+from neo.eval.tracking import start_experiment  # noqa: E402
 
 LR_KEY = "lr"
 
@@ -105,6 +118,78 @@ def fmt(s: dict) -> str:
     )
 
 
+def bias_figure(table4, title):
+    """Median (95% CI) per parameter, one marker per image set."""
+    params = list(metrics.PARAMETERS)
+    fig, axes = plt.subplots(1, len(params), figsize=(3 * len(params), 3.6), sharey=False)
+    for ax, p in zip(axes, params, strict=True):
+        for i, entry in enumerate(table4):
+            st = entry[p]
+            if not st.get("n"):
+                continue
+            err = [[st["median"] - st["median_ci_lo"]], [st["median_ci_hi"] - st["median"]]]
+            ax.errorbar(i, st["median"], yerr=err, fmt="o", capsize=3)
+        ax.axhline(0, color="0.6", lw=0.8)
+        ax.set_xticks(range(len(table4)), [e["image"] for e in table4], rotation=45)
+        ax.set_title(p)
+    fig.suptitle(title)
+    fig.tight_layout()
+    return fig
+
+
+def checkpoint_of(directory: Path, name: str) -> str:
+    """Run/checkpoint recorded by predict.py in a prediction's header."""
+    header = fits.getheader(directory / name)
+    return "/".join(str(header[k]) for k in ("NEORUN", "NEOCKPT") if k in header)
+
+
+def track(args, split, preds, names, kept, rows, elongated, table4, gains, pairwise, out, fig):
+    experiment = start_experiment(
+        f"compare {split.name}-{args.subset}: {' vs '.join(preds)}",
+        ["comparison", args.subset, *preds, *args.tag],
+    )
+    experiment.log_parameters(
+        {
+            "split_dir": str(split.resolve()),
+            "subset": args.subset,
+            "models": ",".join(preds),
+            "factor": args.factor,
+            "npixels": args.npixels,
+            "threshold": args.threshold if args.threshold is not None else "paper (per pair)",
+            "nsigma": args.nsigma,
+            "min_ellipticity": args.min_ellipticity,
+            "balance_noise": args.balance_noise,
+            "n_pairs": len(names),
+            "n_sets_kept": kept,
+            "n_sources": len(rows),
+            "n_sources_orientation": int(elongated.sum()),
+            "out": str(out.resolve()),
+            **{f"pred_dir/{m}": str(d.resolve()) for m, d in preds.items()},
+            **{f"checkpoint/{m}": checkpoint_of(d, names[0]) for m, d in preds.items()},
+        }
+    )
+    for entry in table4:
+        for p, st in entry.items():
+            if p != "image" and st.get("n"):
+                for k in ("median", "median_ci_lo", "median_ci_hi", "nmad", "mean", "std", "n"):
+                    experiment.log_metric(f"{entry['image']}/{p}/{k}", st[k])
+    for g in gains:
+        if g.get("n"):
+            for k in ("frac_improved", "mean_log_gain", "n"):
+                experiment.log_metric(f"{g['model']}/{g['parameter']}/gain_{k}", g[k])
+    for pw in pairwise:
+        experiment.log_metric(
+            f"{pw['a']}_vs_{pw['b']}/{pw['parameter']}/frac_a_closer", pw["frac_a_closer"]
+        )
+    for fname in ("table4.csv", "gains.csv", "pairwise.csv", "sources.csv"):
+        if (out / fname).exists():
+            experiment.log_table(str(out / fname))
+    experiment.log_asset(str(out / "table4.md"))
+    experiment.log_text((out / "table4.md").read_text())
+    experiment.log_figure(figure_name="table4 median bias", figure=fig)
+    experiment.end()
+
+
 def column(rows, key, mask=None):
     x = np.array([r[key] for r in rows], dtype=float)
     return x if mask is None else x[mask]
@@ -133,6 +218,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="orientation is only scored where HST ellipticity >= this",
     )
     parser.add_argument("--balance-noise", action="store_true", help="refill zeros in SR outputs")
+    parser.add_argument("--tag", action="append", default=[], help="extra Comet tag (repeatable)")
+    parser.add_argument("--no-comet", action="store_true", help="do not track the run on Comet")
     return parser.parse_args(argv)
 
 
@@ -274,6 +361,11 @@ def main(argv=None) -> None:
         )
     (out / "table4.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
+    fig = bias_figure(table4, f"{split.name} {args.subset}: {kept} sets, {len(rows)} sources")
+    fig.savefig(out / "table4.png", dpi=120)
+    if not args.no_comet:
+        track(args, split, preds, names, kept, rows, elongated, table4, gains, pairwise, out, fig)
+    plt.close(fig)
     print(f"\nreport written to {out}")
 
 

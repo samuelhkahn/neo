@@ -13,10 +13,12 @@
 # Lux: account, qos and partition must all be given (they share a name). No GPU GRES is configured, so
 # --exclusive takes a whole comp-astro node (2x V100) and training uses GPU 0.
 # CONFIG / ENTRY select another experiment's smoke run (defaults: NEO, train.py).
+# Also checks that this compute node can log to Comet (scripts/lux/comet_check.sh).
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 export PATH="$HOME/.local/bin:$PATH"
 : "${NEO_DATA:?set NEO_DATA}"
+source scripts/lux/comet_check.sh
 
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 uv run python -c "import torch; print('torch', torch.__version__, torch.version.cuda, '|', torch.cuda.get_device_name(0), 'sm', torch.cuda.get_device_capability(0))"

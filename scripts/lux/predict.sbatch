@@ -18,6 +18,7 @@ set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 export PATH="$HOME/.local/bin:$PATH"
 : "${NEO_DATA:?set NEO_DATA}"
+source scripts/lux/comet_check.sh
 : "${CONFIG:?set CONFIG to the training .ini of the model}"
 : "${MODEL:?set MODEL to a short name, e.g. neo, swinir, diffusion}"
 : "${CKPT:?set CKPT to the checkpoint to evaluate, e.g. \$NEO_DATA/checkpoints/<run>/step_00500000.pt}"
