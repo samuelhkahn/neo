@@ -26,7 +26,22 @@ def gan_predictor(config, checkpoint, device, mode: str = "eval"):
     return predict
 
 
-PREDICTORS = {"neo": gan_predictor}
+def diffusion_predictor(config, checkpoint, device, weights: str = "ema", steps=None, **_):
+    from neo import diffusion
+
+    model = diffusion.build(config["DIFFUSION"])
+    state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    model.load_state_dict(state[weights])
+    model.to(device).eval()
+    steps = steps or config.getint("DIFFUSION", "sample_steps", fallback=18)
+
+    def predict(lr, cond):
+        return diffusion.super_resolve(model, cond.to(device), steps)
+
+    return predict
+
+
+PREDICTORS = {"neo": gan_predictor, "diffusion": diffusion_predictor}
 
 
 def build_predictor(config, checkpoint, device, **options):
