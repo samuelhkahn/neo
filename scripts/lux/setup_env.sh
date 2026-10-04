@@ -26,7 +26,7 @@ cat <<EOF
 
 Environment ready. Next steps:
   export NEO_DATA=/data/<your area>/neo        # add to ~/.bashrc
-  export COMET_ML_ASTRO_API_KEY=...            # add to ~/.bashrc (optional; offline logging otherwise)
+  export COMET_ML_ASTRO_API_KEY=...            # add to ~/.bashrc (required: jobs stop without Comet)
   nohup bash scripts/lux/download_data.sh > logs/download.out 2>&1 &
   sbatch scripts/lux/make_pairs.sbatch
   sbatch scripts/lux/smoke.sbatch
