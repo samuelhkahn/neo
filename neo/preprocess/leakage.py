@@ -193,13 +193,17 @@ def groups_of(names, edges):
 
 
 def read_split(pairs: Path, split: str):
-    """Complete pairs (names, LR footprints, pair ids) and names missing their lr or hr half."""
+    """Complete pairs (names, LR footprints, pair ids) and names missing their lr or hr half.
+
+    A pair id also carries the cutout's UNITS card, so a rebuild in other units is another build.
+    """
     listed = {kind: {p.name for p in (pairs / split / kind).glob("*.fits")} for kind in KINDS}
     names = sorted(listed["lr"] & listed["hr"])
     orphans = sorted(listed["lr"] ^ listed["hr"])
     headers = [fits.getheader(pairs / split / "lr" / n) for n in names]
     corners = np.array([footprint(h) for h in headers]).reshape(-1, 4, 2)
-    return names, corners, [pair_id(h) for h in headers], orphans
+    ids = [f"{pair_id(h)}|{h.get('UNITS', 'njy')}" for h in headers]
+    return names, corners, ids, orphans
 
 
 def linked_names(directory: Path):
