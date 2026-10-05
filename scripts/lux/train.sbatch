@@ -23,6 +23,7 @@ export PATH="$HOME/.local/bin:$PATH"
 export PYTHONUNBUFFERED=1   # print() lines reach logs/ as they happen, not at exit
 : "${NEO_DATA:?set NEO_DATA}"
 CONFIG="${CONFIG:-neo/configs/lux.ini}"
+source scripts/lux/job_tmp.sh
 source scripts/lux/comet_check.sh
 # refuse to resume checkpoints trained on another pairs build (neo/preprocess/manifest.py)
 uv run python -m neo.preprocess.manifest guard "$CONFIG"
