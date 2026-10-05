@@ -4,6 +4,8 @@ Port of the paper's final catalog pipeline (`Create Catalogs .ipynb`, July 2025,
 `jades_photutils_interface.py`): sources are detected and deblended on the HST image only, and that
 one segmentation map is used to measure every super-resolved image and, reprojected to the coarse
 grid, the low-resolution image. Every model is therefore measured on exactly the same sources.
+The published Table 4 rows reproduce only with LR shapes taken from the LR image's smoothed copy,
+as in the 2023 copy of that notebook (the July 2025 copy comments it out): catalog_set(lr_fwhm=...).
 """
 
 import numpy as np
@@ -20,10 +22,16 @@ from photutils.segmentation import (
 )
 from reproject import reproject_interp
 
-# Paper detection threshold on HST F814W in counts/s per 0.028" pixel (CreateSourceCatalog default).
+# Paper detection threshold (CreateSourceCatalog default) on HST F814W in e-/s per 0.03" pixel:
+# the paper resampled CANDELS (0.03") onto its 0.028" grid preserving surface brightness, so this
+# is a surface brightness per native pixel (the paper's Create Catalogs notebook, CANDELS e-/s).
 PAPER_THRESHOLD_CPS = 0.00691259209997952
-PAPER_HR_PIXEL_ARCSEC = 0.168 / 6
-NPIXELS = 100
+PAPER_THRESHOLD_PIXEL_ARCSEC = 0.03
+# The paper's catalog grid: HSC 0.168" pixels and the HST grid nested 6x finer (0.028").
+PAPER_LR_PIXEL_ARCSEC = 0.168
+PAPER_HR_PIXEL_ARCSEC = PAPER_LR_PIXEL_ARCSEC / 6
+NPIXELS = 100  # minimum source area in pixels (detection and deblending)
+KERNEL_FWHM = 3.0  # detection smoothing FWHM in pixels (CreateConvolvedData)
 
 # Same property set as the paper's COLUMNS (minus the sky_bbox_* entries, which need a WCS and
 # feed no metric); `label` is kept to join sources across images.
@@ -52,20 +60,55 @@ COLUMNS = [
 
 
 def default_threshold(njy_per_count: float, hr_pixel_arcsec: float) -> float:
-    """Paper threshold in the pairs' units: counts/s -> nJy, 0.028" -> our HR pixel area."""
-    return PAPER_THRESHOLD_CPS * njy_per_count * (hr_pixel_arcsec / PAPER_HR_PIXEL_ARCSEC) ** 2
+    """Paper threshold in nJy per HR pixel: e-/s -> nJy, per 0.03" pixel -> per HR pixel.
+
+    For --units paper pairs this equals PAPER_THRESHOLD_CPS * NJYPERPX of the HR cutout.
+    """
+    return (
+        PAPER_THRESHOLD_CPS * njy_per_count * (hr_pixel_arcsec / PAPER_THRESHOLD_PIXEL_ARCSEC) ** 2
+    )
 
 
-def create_convolved_data(data: np.ndarray) -> np.ndarray:
-    """Smooth with a FWHM = 3 px Gaussian on a 3x3 kernel (NaN -> 0), as in CreateConvolvedData."""
-    kernel = Gaussian2DKernel(3.0 * gaussian_fwhm_to_sigma, x_size=3, y_size=3)
+def paper_npixels(hr_pixel_arcsec: float) -> int:
+    """The paper's minimum area (100 px at 0.028") in HR pixels of the same sky area."""
+    return int(round(NPIXELS * (PAPER_HR_PIXEL_ARCSEC / hr_pixel_arcsec) ** 2))
+
+
+def kernel_width(fwhm: float) -> float:
+    """RMS width (px, per axis) of the 3x3 Gaussian kernel create_convolved_data uses."""
+    kernel = Gaussian2DKernel(fwhm * gaussian_fwhm_to_sigma, x_size=3, y_size=3).array
+    kernel = kernel / kernel.sum()
+    return float(np.sqrt((kernel.sum(axis=0) * np.array([1.0, 0.0, 1.0])).sum()))
+
+
+def paper_fwhm(pixel_arcsec: float, paper_pixel_arcsec: float = PAPER_HR_PIXEL_ARCSEC) -> float:
+    """FWHM (px of `pixel_arcsec`) whose 3x3 kernel smooths the sky as much as the paper's did.
+
+    The paper smoothed with FWHM 3 px on a 3x3 kernel, so truncation sets the width: matching the
+    kernels' RMS width on the sky (not the nominal FWHM) is what reproduces its detection.
+    """
+    target = kernel_width(KERNEL_FWHM) * paper_pixel_arcsec / pixel_arcsec
+    lo, hi = 0.05, 50.0
+    if not kernel_width(lo) < target < kernel_width(hi):
+        raise ValueError(f"no 3x3 Gaussian kernel is {target:.3f} px wide")
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if kernel_width(mid) < target else (lo, mid)
+    return (lo + hi) / 2
+
+
+def create_convolved_data(data: np.ndarray, fwhm: float = KERNEL_FWHM) -> np.ndarray:
+    """Smooth with a Gaussian on a 3x3 kernel (NaN -> 0), as in CreateConvolvedData (FWHM 3 px)."""
+    kernel = Gaussian2DKernel(fwhm * gaussian_fwhm_to_sigma, x_size=3, y_size=3)
     data_zeros = np.where(np.isnan(data), 0, data)
     return convolve(data_zeros, kernel, normalize_kernel=True)
 
 
-def detect_hst(data: np.ndarray, threshold: float, npixels: int = NPIXELS):
+def detect_hst(
+    data: np.ndarray, threshold: float, npixels: int = NPIXELS, fwhm: float = KERNEL_FWHM
+):
     """Detect + deblend on HST (CreateSourceCatalog); returns (segm, convolved) or None."""
-    convolved = create_convolved_data(data)
+    convolved = create_convolved_data(data, fwhm)
     segm = detect_sources(convolved, threshold, npixels=npixels)
     if segm is None:
         return None
@@ -109,13 +152,24 @@ def measure(cat: SourceCatalog) -> Table:
     return out
 
 
-def catalog_set(hst, srs: dict, lr, threshold: float, factor: int = 6, npixels: int = NPIXELS):
+def catalog_set(
+    hst,
+    srs: dict,
+    lr,
+    threshold: float,
+    factor: int = 6,
+    npixels: int = NPIXELS,
+    fwhm: float = KERNEL_FWHM,
+    lr_fwhm: float | None = None,
+):
     """Catalog one cutout set; returns (hst_table, {model: table}, lr_table) or None.
 
-    `hst` and each SR image must already be background subtracted; `lr` is used as-is. As in the
+    Images are measured as given (background subtraction or clipping is the caller's). HST and
+    SR shapes come from images smoothed with `fwhm`; LR shapes from the LR image itself, or from
+    its copy smoothed with `lr_fwhm` (as the code behind the paper's Table 4 did). As in the
     paper, a set is kept only when the reprojected LR catalog has as many sources as HST.
     """
-    detected = detect_hst(hst, threshold, npixels)
+    detected = detect_hst(hst, threshold, npixels, fwhm)
     if detected is None:
         return None
     segm, convolved = detected
@@ -123,11 +177,12 @@ def catalog_set(hst, srs: dict, lr, threshold: float, factor: int = 6, npixels: 
     segm_lr = lr_segmap(segm, lr.shape, factor)
     if segm_lr is None:
         return None
-    lr_tbl = measure(SourceCatalog(lr, segm_lr))
+    lr_conv = None if lr_fwhm is None else create_convolved_data(lr, lr_fwhm)
+    lr_tbl = measure(SourceCatalog(lr, segm_lr, convolved_data=lr_conv))
     if len(lr_tbl) != len(hst_tbl):
         return None
     sr_tbls = {
-        name: measure(SourceCatalog(sr, segm, convolved_data=create_convolved_data(sr)))
+        name: measure(SourceCatalog(sr, segm, convolved_data=create_convolved_data(sr, fwhm)))
         for name, sr in srs.items()
     }
     return hst_tbl, sr_tbls, lr_tbl

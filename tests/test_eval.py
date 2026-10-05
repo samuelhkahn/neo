@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from photutils.segmentation import SegmentationImage
+from photutils.segmentation import SegmentationImage, SourceCatalog
 
 from neo.data.dataset import SR_HST_HSC_Dataset
 from neo.eval import catalogs, metrics, postprocess
@@ -51,15 +51,47 @@ def test_paper_segmap_reprojection_lands_on_the_nested_grid():
     assert list(zip(*np.nonzero(lr), strict=True)) == [(10, 20)]
 
 
-def test_default_threshold_converts_the_paper_value():
-    # same units and pixel scale as the paper -> unchanged; 152.4 nJy per count, 0.0333" pixels
-    assert catalogs.default_threshold(1.0, 0.028) == pytest.approx(catalogs.PAPER_THRESHOLD_CPS)
-    expected = catalogs.PAPER_THRESHOLD_CPS * 152.4 * (0.2 / 6 / 0.028) ** 2
-    assert catalogs.default_threshold(152.4, 0.2 / 6) == pytest.approx(expected)
+def test_default_threshold_is_the_paper_surface_brightness_per_0p03_pixel():
+    # the paper's value is e-/s per native 0.03" pixel (its 0.028" grid preserved surface
+    # brightness): unchanged in e-/s on 0.03" pixels, whatever the grid it was sampled on
+    assert catalogs.default_threshold(1.0, 0.03) == pytest.approx(catalogs.PAPER_THRESHOLD_CPS)
+    # COSMOS-Web F814W (ZP 25.94: 152.76 nJy per e-/s) on our 0.0333" grid: 1.3036 nJy per pixel
+    hrscale = 152.7566058238
+    assert catalogs.default_threshold(hrscale, 0.2 / 6) == pytest.approx(1.3036, rel=1e-4)
+    # for --units paper pairs it is the paper's number times the cutout's NJYPERPX
+    njy_per_px = hrscale * (0.2 / 6 / 0.03) ** 2
+    assert catalogs.default_threshold(hrscale, 0.2 / 6) == pytest.approx(
+        catalogs.PAPER_THRESHOLD_CPS * njy_per_px, rel=1e-12
+    )
 
 
-@pytest.fixture(scope="module")
-def scene():
+def test_paper_minimum_area_and_kernel_match_the_paper_on_the_sky():
+    assert catalogs.paper_npixels(0.168 / 6) == 100
+    assert catalogs.paper_npixels(0.2 / 6) == 71  # 100 * (0.028 / 0.0333)^2 = 70.56
+    assert catalogs.paper_fwhm(0.168 / 6) == pytest.approx(3.0)
+    # same smoothing on the sky as the paper's 3 px FWHM on a 3x3 kernel (truncation included)
+    hr_fwhm = catalogs.paper_fwhm(0.2 / 6)
+    assert hr_fwhm == pytest.approx(1.652, abs=1e-3)
+    assert catalogs.kernel_width(hr_fwhm) * 0.2 / 6 == pytest.approx(
+        catalogs.kernel_width(3.0) * 0.168 / 6
+    )
+    assert catalogs.paper_fwhm(0.2, catalogs.PAPER_LR_PIXEL_ARCSEC) == pytest.approx(hr_fwhm)
+    assert catalogs.paper_fwhm(0.168, catalogs.PAPER_LR_PIXEL_ARCSEC) == pytest.approx(3.0)
+
+
+def test_create_convolved_data_default_is_the_papers_3px_kernel():
+    rng = np.random.default_rng(4)
+    img = rng.normal(size=(40, 40))
+    np.testing.assert_array_equal(
+        catalogs.create_convolved_data(img), catalogs.create_convolved_data(img, 3.0)
+    )
+    assert not np.allclose(
+        catalogs.create_convolved_data(img), catalogs.create_convolved_data(img, 2.52)
+    )
+
+
+def scene_images():
+    """Two noisy Gaussian galaxies (HST), a block-summed LR copy and two SR versions."""
     rng = np.random.default_rng(3)
     hst = gaussian((600, 600), 300, 300, 9.0, 40.0) + gaussian(
         (600, 600), 150, 420, 6.0, 25.0, 0.5, 30
@@ -70,6 +102,12 @@ def scene():
         (600, 600), 150, 420, 7.5, 25.0 * (6 / 7.5) ** 2, 0.6, 45
     )
     sr = {"perfect": hst.copy(), "blurry": blurred + rng.normal(0, 0.02, hst.shape)}
+    return hst, sr, lr
+
+
+@pytest.fixture(scope="module")
+def scene():
+    hst, sr, lr = scene_images()
     result = catalogs.catalog_set(
         postprocess.subtract_background(hst),
         {k: postprocess.subtract_background(v) for k, v in sr.items()},
@@ -109,6 +147,34 @@ def test_summarize_and_gain():
     assert s["n"] == 99 and s["median"] == pytest.approx(0.1) and s["nmad"] == 0
     g = metrics.gain(np.array([1.0, 1.0, 1.0, 1.0]), np.array([0.1, 0.1, 0.1, 10.0]))
     assert g["frac_improved"] == 0.75 and g["n"] == 4
+
+
+def test_lr_shapes_from_the_smoothed_copy_when_asked(scene):
+    _, _, lr_tbl = scene
+    hst, _, lr = scene_images()
+    hst = postprocess.subtract_background(hst)
+    smoothed = catalogs.catalog_set(hst, {}, lr, threshold=0.5, lr_fwhm=2.52)[2]
+    segm, _ = catalogs.detect_hst(hst, 0.5)
+    segm_lr = catalogs.lr_segmap(segm, lr.shape, 6)
+    expected = catalogs.measure(
+        SourceCatalog(lr, segm_lr, convolved_data=catalogs.create_convolved_data(lr, 2.52))
+    )
+    np.testing.assert_allclose(smoothed["fwhm"], expected["fwhm"])
+    np.testing.assert_allclose(smoothed["segment_flux"], lr_tbl["segment_flux"])  # fluxes: data
+    assert not np.allclose(smoothed["fwhm"], lr_tbl["fwhm"])  # shapes: the smoothed copy
+
+
+def test_paper_q_statistic_is_minus_our_q_bias_and_a_68pct_spread(scene):
+    hst_tbl, sr_tbls, lr_tbl = scene
+    for tbl in (sr_tbls["blurry"], lr_tbl):
+        b = metrics.ellipticity_bias(hst_tbl, tbl)
+        np.testing.assert_allclose(b, -metrics.per_source(hst_tbl, tbl)["q"], atol=1e-12)
+    b = np.r_[np.linspace(-0.2, 0.3, 101), np.nan]
+    q = metrics.paper_q_statistic(b)
+    finite = b[np.isfinite(b)]
+    assert q["n"] == 101 and q["median"] == pytest.approx(np.median(finite))
+    assert q["q68"] == pytest.approx(np.quantile(np.abs(finite - np.median(finite)), 0.68))
+    assert q["std"] == pytest.approx(np.std(finite))
 
 
 def test_per_source_rejects_misaligned_catalogs(scene):
