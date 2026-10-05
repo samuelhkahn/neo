@@ -19,6 +19,7 @@ cd "$SLURM_SUBMIT_DIR"
 export PATH="$HOME/.local/bin:$PATH"
 export PYTHONUNBUFFERED=1   # print() lines reach logs/ as they happen, not at exit
 : "${NEO_DATA:?set NEO_DATA}"
+source scripts/lux/job_tmp.sh
 source scripts/lux/comet_check.sh
 
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
