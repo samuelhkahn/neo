@@ -29,11 +29,9 @@ export PATH="$HOME/.local/bin:$PATH"
 export PYTHONUNBUFFERED=1   # print() lines reach logs/ as they happen, not at exit
 : "${NEO_DATA:?set NEO_DATA}"
 PAIRS="$NEO_DATA/pairs/cosmos_web_i"
-# reproject's parallel mode spills ~6 GB of zarr chunks per LSST image to $TMPDIR; a compute node's
-# /tmp can be too small, so use a per-job directory on the data filesystem instead
-export TMPDIR="$NEO_DATA/tmp/pairs-${SLURM_JOB_ID:-$$}"
-mkdir -p "$TMPDIR"
-trap 'rm -rf "$TMPDIR"' EXIT
+# reproject's parallel mode spills ~6 GB of zarr chunks per LSST image to $TMPDIR, more than a
+# compute node's 2 GB /tmp: job_tmp.sh moves TMPDIR to the data filesystem
+source scripts/lux/job_tmp.sh
 df -h /tmp "$NEO_DATA" | sed 's/^/disk: /'
 
 uv run python -m neo.preprocess.pairs \

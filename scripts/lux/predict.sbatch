@@ -28,6 +28,7 @@ cd "$SLURM_SUBMIT_DIR"
 export PATH="$HOME/.local/bin:$PATH"
 export PYTHONUNBUFFERED=1   # print() lines reach logs/ as they happen, not at exit
 : "${NEO_DATA:?set NEO_DATA}"
+source scripts/lux/job_tmp.sh
 source scripts/lux/comet_check.sh
 : "${CONFIG:?set CONFIG to the training .ini of the model}"
 : "${MODEL:?set MODEL to a short name, e.g. neo, swinir, diffusion}"
