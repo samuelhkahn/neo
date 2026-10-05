@@ -11,6 +11,21 @@ Train/val split (--split):
         and val (neo.preprocess.leakage verifies this on the written cutouts).
   rows  (legacy) the bottom rows of each LSST image are val. Patches overlap their neighbours by
         300 px, so this shares sky between one patch's val and the next patch's train.
+Units (--units):
+  paper  the NEO paper's conventions, so its fixed log stretch sees the paper's values for any sky:
+         HR is the HST mosaic resampled with reproject_interp (surface brightness preserved), as
+         e-/s per 0.03" pixel (the paper's CANDELS mosaic pixel); LR is converted from nJy to
+         HSC counts (AB zeropoint 27) per 0.168" pixel of equal surface brightness. NJYPERPX in
+         each header converts a stored value to nJy per pixel of that cutout.
+  njy    both in nJy per pixel; HR flux-conserving (reproject_adaptive).
+--hr-sky-subtract removes each LSST image's HST sky pedestal (3-sigma-clipped median of the
+resampled HR) before cutting: the paper's CANDELS mosaic sat at ~0.01 sigma, a COSMOS-Web DR1 tile
+at ~0.3 sigma, which shifts what survives the dataset's clip at 0.
+--flux-filter LOW HIGH keeps a pair only if LOW < ln(HR pixel sum) < HIGH, as the paper's
+neo/data/filter_samples.py did (2 7, e-/s). The paper summed its whole 852 px cutout on a
+0.028" grid (23.9"); here the sum covers the same sky (the central 0.168/0.2 of the cutout),
+scaled to the paper's sampling density, so the cut rejects the same fields (--units paper only).
+
 Window counts: --train-density D samples about D windows per train pixel (coverage ~1 - e^-D);
 --val-tile packs non-overlapping val windows (every val source appears once). Without them,
 --per-patch random windows are split by --val-frac.
@@ -29,17 +44,23 @@ from pathlib import Path
 
 import numpy as np
 from astropy.io import fits
+from astropy.stats import sigma_clipped_stats
 from astropy.utils.exceptions import AstropyWarning
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
-from reproject import reproject_adaptive
+from reproject import reproject_adaptive, reproject_interp
 from scipy.ndimage import binary_erosion, distance_transform_edt
 
 from neo.preprocess.grid import lr_window_mask, upsampled_wcs
-from neo.surveys.hst.mosaic import MosaicSet
+from neo.surveys.hst.mosaic import MosaicSet, njy_per_count
 from neo.surveys.rubin.coadd import flagged_pixels, load_coadd
 
 DEFAULT_REJECT = ("NO_DATA", "SATURATED")
+# The NEO paper's LR: HSC coadds in counts at AB zeropoint 27, 0.168" pixels
+HSC_ZEROPOINT = 27.0
+HSC_PIXEL_ARCSEC = 0.168
+# ... and HR: HST e-/s per 0.03" pixel (CANDELS F814W, resampled preserving surface brightness)
+PAPER_HST_PIXEL_ARCSEC = 0.03
 SPLITS = ("train", "val")
 
 
@@ -75,30 +96,38 @@ def union_box(boxes):
     return y0, y1, x0, x1
 
 
-def hr_on_lr_grid(hr_data, hr_wcs, lr_wcs, lr_shape, factor, block_size=2048, parallel=False):
-    """Flux-conserving reprojection of `hr_data` onto the grid nested `factor`x inside `lr_wcs`."""
+def hr_on_lr_grid(
+    hr_data, hr_wcs, lr_wcs, lr_shape, factor, block_size=2048, parallel=False, method="adaptive"
+):
+    """Reproject `hr_data` onto the grid nested `factor`x inside `lr_wcs`.
+
+    method "adaptive": flux-conserving (values become flux per output pixel);
+    method "interp": bilinear reproject_interp, as the NEO paper did (values stay surface
+    brightness, i.e. per native input pixel).
+    """
     target = upsampled_wcs(lr_wcs, factor)
     shape_out = (lr_shape[0] * factor, lr_shape[1] * factor)
-    hr, footprint = reproject_adaptive(
-        (hr_data, hr_wcs),
-        target,
-        shape_out=shape_out,
-        conserve_flux=True,
-        block_size=(block_size, block_size),
-        parallel=parallel,
-    )
+    common = dict(shape_out=shape_out, block_size=(block_size, block_size), parallel=parallel)
+    if method == "interp":
+        hr, footprint = reproject_interp((hr_data, hr_wcs), target, order="bilinear", **common)
+    elif method == "adaptive":
+        hr, footprint = reproject_adaptive((hr_data, hr_wcs), target, conserve_flux=True, **common)
+    else:
+        raise ValueError(f"unknown resampling method {method!r}")
     valid = (footprint > 0) & np.isfinite(hr) & (hr != 0)
     return np.nan_to_num(hr).astype(np.float32), valid, target
 
 
-def merge_on_lr_grid(regions, lr_wcs, lr_shape, factor, block_size=2048, parallel=False):
+def merge_on_lr_grid(
+    regions, lr_wcs, lr_shape, factor, block_size=2048, parallel=False, method="adaptive"
+):
     """Reproject several HR tiles onto one nested grid; the first tile with data wins per pixel."""
     hr = np.zeros((lr_shape[0] * factor, lr_shape[1] * factor), np.float32)
     valid = np.zeros_like(hr, dtype=bool)
     hr_wcs = None
     for data, wcs in regions:
         tile, tile_valid, hr_wcs = hr_on_lr_grid(
-            data, wcs, lr_wcs, lr_shape, factor, block_size, parallel
+            data, wcs, lr_wcs, lr_shape, factor, block_size, parallel, method
         )
         take = tile_valid & ~valid
         hr[take] = tile[take]
@@ -211,8 +240,11 @@ def process_patch(
     guard=6.0,
     train_density=None,
     val_tile=False,
+    units="njy",
+    flux_filter=None,
+    hr_sky_subtract=False,
 ):
-    counts = {"train": 0, "val": 0, "valid": 0}
+    counts = {"train": 0, "val": 0, "valid": 0, "filtered": 0, "hr_sky": 0.0}
     coadd = load_coadd(lr_path)
     regions = mosaic.regions(*sky_bbox(coadd.wcs, coadd.image.shape))
     box = union_box(
@@ -222,9 +254,31 @@ def process_patch(
         return counts
     y0, y1, x0, x1 = box
     sub_wcs = coadd.wcs[y0:y1, x0:x1]
+    if flux_filter is not None and units != "paper":
+        raise ValueError("--flux-filter thresholds are in the paper's units: use --units paper")
+    method = "interp" if units == "paper" else "adaptive"
     hr, hr_valid, hr_wcs = merge_on_lr_grid(
-        regions, sub_wcs, (y1 - y0, x1 - x0), factor, block_size, parallel
+        regions, sub_wcs, (y1 - y0, x1 - x0), factor, block_size, parallel, method
     )
+    if hr_sky_subtract and hr_valid.any():
+        sample = hr[::7, ::7][hr_valid[::7, ::7]]  # ~2% of pixels is plenty for a median
+        _, sky, sigma = sigma_clipped_stats(sample, sigma=3, maxiters=10)
+        hr[hr_valid] -= sky
+        counts["hr_sky"] = float(sky)
+        counts["hr_sky_sigma"] = float(sky / sigma) if sigma > 0 else 0.0
+    lr_pixel = float(np.mean(proj_plane_pixel_scales(coadd.wcs.celestial))) * 3600
+    hr_pixel = lr_pixel / factor
+    native = float(np.mean(proj_plane_pixel_scales(regions[0][1].celestial))) * 3600
+    if units == "paper":
+        # stored = nJy * lr_scale = HSC counts (ZP 27) per 0.168" pixel at equal surface brightness
+        lr_scale = (HSC_PIXEL_ARCSEC / lr_pixel) ** 2 / njy_per_count(HSC_ZEROPOINT)
+        # resampled values are e-/s per native mosaic pixel; restate per 0.03" pixel
+        hr_scale = (PAPER_HST_PIXEL_ARCSEC / native) ** 2
+        hr_njy_per_px = mosaic.njy_per_count * (hr_pixel / PAPER_HST_PIXEL_ARCSEC) ** 2
+        lr_bunit, hr_bunit = "HSC count (ZP 27) per 0.168as px", "e-/s per 0.03as px"
+    else:
+        lr_scale, hr_scale, hr_njy_per_px = 1.0, mosaic.njy_per_count, 1.0
+        lr_bunit, hr_bunit = coadd.bunit, "nJy"
     # Erode one LR pixel so windows stay clear of the resampled footprint edge.
     ok = binary_erosion(lr_window_mask(hr_valid, factor))
     ok &= ~flagged_pixels(coadd, reject)[y0:y1, x0:x1]
@@ -244,24 +298,48 @@ def process_patch(
             corners, _ = sample_windows(mask, size, n, rng)
         else:
             corners, _ = sample_windows(mask, size, wanted[split], rng)
+        written = 0
         for k, (cy, cx) in enumerate(corners):
             ly, lx = y0 + cy, x0 + cx
-            lr_cut = coadd.image[ly : ly + size, lx : lx + size]
             hr_cut = hr[factor * cy : factor * (cy + size), factor * cx : factor * (cx + size)]
-            hr_cut = (hr_cut * mosaic.njy_per_count).astype(np.float32)
-            cards = {"LRFILE": lr_path.name, "LRX0": lx, "LRY0": ly, "SRFACTOR": factor}
+            hr_cut = (hr_cut * hr_scale).astype(np.float32)
+            if flux_filter is not None:
+                n = int(round(hr_cut.shape[0] * HSC_PIXEL_ARCSEC / lr_pixel))
+                o = (hr_cut.shape[0] - n) // 2
+                paper_sum = (
+                    np.sum(hr_cut[o : o + n, o : o + n], dtype=np.float64)
+                    * (hr_pixel * factor / HSC_PIXEL_ARCSEC) ** 2
+                )
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    log_sum = np.log(paper_sum)
+                if not flux_filter[0] < log_sum < flux_filter[1]:  # NaN (sum <= 0) fails too
+                    counts["filtered"] += 1
+                    continue
+            lr_cut = (coadd.image[ly : ly + size, lx : lx + size] * lr_scale).astype(np.float32)
+            cards = {
+                "LRFILE": lr_path.name,
+                "LRX0": lx,
+                "LRY0": ly,
+                "SRFACTOR": factor,
+                "UNITS": units,
+            }
             hr_cards = {
                 **cards,
-                "BUNIT": "nJy",
+                "BUNIT": hr_bunit,
+                "NJYPERPX": hr_njy_per_px,
                 "HRZPAB": mosaic.zeropoint,
                 "HRSCALE": mosaic.njy_per_count,
+                "HRPIXNAT": native,
+                "HRSKYSUB": counts["hr_sky"],
             }
+            lr_cards = {**cards, "BUNIT": lr_bunit, "NJYPERPX": 1.0 / lr_scale}
             name = f"{lr_path.stem}_{split}_{k:05d}.fits"
-            lr_hdu = cutout_hdu(lr_cut, coadd.wcs, ly, lx, {**cards, "BUNIT": coadd.bunit})
+            lr_hdu = cutout_hdu(lr_cut, coadd.wcs, ly, lx, lr_cards)
             hr_hdu = cutout_hdu(hr_cut, hr_wcs, factor * cy, factor * cx, hr_cards)
             lr_hdu.writeto(out / split / "lr" / name, overwrite=True)
             hr_hdu.writeto(out / split / "hr" / name, overwrite=True)
-        counts[split] = len(corners)
+            written += 1
+        counts[split] = written
     return counts
 
 
@@ -298,6 +376,21 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--val-tile", action="store_true", help="pack non-overlapping val windows (not --per-patch)"
+    )
+    parser.add_argument(
+        "--units", choices=["njy", "paper"], default="njy", help="pixel units (module docstring)"
+    )
+    parser.add_argument(
+        "--hr-sky-subtract",
+        action="store_true",
+        help="subtract each LSST image's HST sky pedestal (module docstring)",
+    )
+    parser.add_argument(
+        "--flux-filter",
+        type=float,
+        nargs=2,
+        metavar=("LOW", "HIGH"),
+        help="keep pairs with LOW < ln(sum of stored HR pixels) < HIGH (paper: 2 7, --units paper)",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -357,6 +450,9 @@ def main(argv=None) -> None:
             "train_density",
             "val_tile",
             "hr_zeropoint",
+            "units",
+            "flux_filter",
+            "hr_sky_subtract",
         )
     }
     settings["hr_mosaic"] = sorted(Path(m).name for m in args.hr_mosaic)
@@ -411,13 +507,18 @@ def main(argv=None) -> None:
             guard=args.guard,
             train_density=args.train_density,
             val_tile=args.val_tile,
+            units=args.units,
+            flux_filter=args.flux_filter,
+            hr_sky_subtract=args.hr_sky_subtract,
         )
         for split in SPLITS:
             totals[split] += counts[split]
         marker.write_text(json.dumps(counts))
         print(
             f"{path.name}: {counts['valid']} valid windows, wrote {counts['train']} train + "
-            f"{counts['val']} val ({time.time() - t0:.0f} s)"
+            f"{counts['val']} val, {counts['filtered']} filtered, HR sky "
+            f"{counts['hr_sky']:.2e} ({counts.get('hr_sky_sigma', 0):+.2f} sigma) removed "
+            f"({time.time() - t0:.0f} s)"
         )
     size_gb = sum(totals.values()) * pair_bytes / 1e9
     print(f"{totals['train']} train + {totals['val']} val pairs -> {out} (~{size_gb:.1f} GB)")
