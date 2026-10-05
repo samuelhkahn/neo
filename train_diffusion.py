@@ -23,7 +23,7 @@ from torchvision.transforms import CenterCrop
 from tqdm import tqdm
 
 from neo import diffusion
-from neo.data.augment import train_dataset_class
+from neo.data.augment import dataset_classes
 from neo.data.collate_fn import collate_fn
 from neo.data.dataset import SR_HST_HSC_Dataset
 from neo.log_figure import log_figure
@@ -176,10 +176,10 @@ def main():
         )
 
     # [DATA_AUG] augment applies to training only (val keeps the centre crop), as in train.py
-    augment, TrainDataset = train_dataset_class(config)
+    augment, TrainDataset, ValDataset = dataset_classes(config)
     experiment.log_parameter("augment", augment)
     dataloader_train = make_loader(hst_path_train, hsc_path_train, TrainDataset)
-    dataloader_val = make_loader(hst_path_val, hsc_path_val)
+    dataloader_val = make_loader(hst_path_val, hsc_path_val, ValDataset)
     val_iter = iter(dataloader_val)
 
     def next_val_batch():
