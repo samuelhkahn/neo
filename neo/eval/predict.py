@@ -2,18 +2,25 @@
 
 Inputs go through the training dataset class unchanged (center crop -> clip -> log scale -> pad,
 no augmentation), so every model sees exactly what it was trained on. Outputs are cropped to the
-central 600 px and inverse log-scaled (neo.eval.postprocess.to_physical), then written as
-<out>/<pair name>.fits with the HR cutout's WCS. predictions.csv records the log-space L1 against
-the HR target over the same 600 px region.
+central 600 px and inverse log-scaled (neo.eval.postprocess.to_physical) into the HR pairs'
+stored units, converted to nJy per HR pixel with the HR cutout's NJYPERPX (1.0 for nJy pairs),
+then written as <out>/<pair name>.fits (BUNIT nJy) with the HR cutout's WCS. predictions.csv
+records the log-space L1 against the HR target over the same 600 px region.
+
+--gen-mode train runs the GAN generator as the paper generated its SR images: the whole pickled
+generator was loaded and never put in eval mode, so dropout stayed on and batch norm used each
+image's own statistics, at batch size 1 (the paper's neo/analysis/generate_sr_images.py loads the
+pickled generator, never calls .eval() and uses batch_size=1). The default (eval) is deterministic.
 
 --subset select|report|all (neo.eval.subsets) picks which val pairs to predict. Score candidate
 checkpoints on select only (their L1 here, or compare.py --subset select); predict report only
 for the chosen checkpoint, so the reported numbers never influence the choice.
 
-Each output records its checkpoint (NEORUN, NEOCKPT, NEOSTEP) and sky (PAIRID). An existing file
-is reused only when all of those match; anything else stops the run unless --overwrite is given,
-so predictions from another checkpoint or pairs build cannot be mixed in. The run is tracked on
-Comet (neo.eval.tracking): parameters, the config, per-pair L1, example images, predictions.csv.
+Each output records its checkpoint (NEORUN, NEOCKPT, NEOSTEP), generator mode (NEOGMODE), units
+(BUNIT) and sky (PAIRID). An existing file is reused only when all of those match; anything else
+stops the run unless --overwrite is given, so predictions from another checkpoint, mode or pairs
+build cannot be mixed in. The run is tracked on Comet (neo.eval.tracking): parameters, the
+config, per-pair L1, example images, predictions.csv.
 """
 
 import argparse
@@ -32,7 +39,13 @@ from astropy.io import fits  # noqa: E402
 from astropy.wcs import WCS  # noqa: E402
 
 from neo.data.dataset import SR_HST_HSC_Dataset  # noqa: E402
-from neo.eval.postprocess import HR_SIZE, LR_SIZE, center_crop, to_physical  # noqa: E402
+from neo.eval.postprocess import (  # noqa: E402
+    HR_SIZE,
+    LR_SIZE,
+    center_crop,
+    njy_per_px,
+    to_physical,
+)
 from neo.eval.predictors import build_predictor  # noqa: E402
 from neo.eval.subsets import SUBSETS, in_subset, load_groups, pair_id  # noqa: E402
 from neo.eval.tracking import start_experiment  # noqa: E402
@@ -87,7 +100,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--gen-mode",
         choices=["eval", "train"],
         default="eval",
-        help="GAN generator mode at inference (train keeps dropout/batch-stat BatchNorm)",
+        help="GAN generator mode at inference (train: dropout and per-image BatchNorm, as the "
+        "paper generated its SR images; needs --batch-size 1)",
     )
     parser.add_argument(
         "--subset", choices=SUBSETS, default="all", help="val pairs to predict (module docstring)"
@@ -132,7 +146,12 @@ def main(argv=None) -> None:
     state = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
     step = int(state.get("step", -1))
     del state
-    source = {"NEORUN": checkpoint.parent.name, "NEOCKPT": checkpoint.name, "NEOSTEP": step}
+    source = {
+        "NEORUN": checkpoint.parent.name,
+        "NEOCKPT": checkpoint.name,
+        "NEOSTEP": step,
+        "NEOGMODE": args.gen_mode,
+    }
     experiment = None
     if not args.no_comet:
         experiment = start_experiment(
@@ -163,7 +182,8 @@ def main(argv=None) -> None:
         batch = []
         for i in order[start : start + args.batch_size]:
             name = dataset.filenames[i]
-            expected = {**source, "PAIRID": pair_id(fits.getheader(split / "hr" / name))}
+            hr_header = fits.getheader(split / "hr" / name)
+            expected = {**source, "BUNIT": "nJy", "PAIRID": pair_id(hr_header)}
             if (out / name).exists() and not args.overwrite:
                 header = fits.getheader(out / name)
                 differs = {k: header.get(k) for k, v in expected.items() if header.get(k) != v}
@@ -177,20 +197,23 @@ def main(argv=None) -> None:
             if hst is None:
                 print(f"  skipped {name}: dataset returned no sample")
                 continue
-            batch.append((name, hst, hsc, hsc_hr))
+            batch.append((name, hst, hsc, hsc_hr, hr_header))
         if not batch:
             continue
         lr = torch.stack([b[2] for b in batch]).unsqueeze(1)
         cond = torch.stack([b[3] for b in batch]).unsqueeze(1).to(device)
         pred = predict(lr, cond).detach().float().cpu().numpy()[:, 0]
-        for (name, hst, hsc, _), p in zip(batch, pred, strict=True):
+        for (name, hst, hsc, _, hr_header), p in zip(batch, pred, strict=True):
             l1 = float(np.mean(np.abs(center_crop(p, HR_SIZE) - center_crop(hst.numpy(), HR_SIZE))))
             header = cropped_wcs_header(split / "hr" / name, HR_SIZE)
-            header["BUNIT"] = fits.getheader(split / "hr" / name).get("BUNIT", "")
+            header["BUNIT"] = "nJy"
+            njy = njy_per_px(hr_header)
+            header["HRNJYPX"] = (njy, "NJYPERPX of the HR cutout, applied to get nJy")
             header.update(source)
-            header["PAIRID"] = pair_id(fits.getheader(split / "hr" / name))
+            header["PAIRID"] = pair_id(hr_header)
             header["L1LOG"] = l1
-            fits.PrimaryHDU(to_physical(p).astype(np.float32), header=header).writeto(
+            sr = to_physical(p) * njy
+            fits.PrimaryHDU(sr.astype(np.float32), header=header).writeto(
                 out / name, overwrite=True
             )
             rows.append({"name": name, "l1_log": l1})
