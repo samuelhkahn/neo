@@ -366,3 +366,101 @@ def test_resume_refuses_changed_settings(tmp_path):
     run_pairs(tmp_path, tmp_path / "out")
     with pytest.raises(SystemExit, match="guard"):
         run_pairs(tmp_path, tmp_path / "out", "--resume", "--guard", "0.4")
+
+
+def paper_scene(tmp_path, hr_value=0.05, lr_value=10.0):
+    """A 60x60 LSST frame (0.2"/px, nJy) inside a uniform 0.03"/px HST mosaic (e-/s)."""
+    lr_wcs = make_tan_wcs(0.2, (60, 60))
+    center = lr_wcs.pixel_to_world(29.5, 29.5)
+    hr_wcs = make_tan_wcs(0.03, (420, 420), crval=(center.ra.deg, center.dec.deg))
+    image = fits.ImageHDU(
+        np.full((60, 60), lr_value, np.float32), header=lr_wcs.to_header(), name="IMAGE"
+    )
+    image.header["BUNIT"] = "nJy"
+    mask = fits.ImageHDU(np.zeros((60, 60), np.int32), name="MASK")
+    mask.header["MSKN0000"], mask.header["MSKM0000"] = "NO_DATA", 1
+    lr_path = tmp_path / "deep_coadd_1_2_i.fits"
+    fits.HDUList([fits.PrimaryHDU(), image, mask]).writeto(lr_path)
+    write_mosaic(tmp_path / "mosaic.fits", np.full((420, 420), hr_value, np.float32), hr_wcs)
+    out = tmp_path / "pairs"
+    for split in ("train", "val"):
+        for kind in ("lr", "hr"):
+            (out / split / kind).mkdir(parents=True)
+    return lr_path, MosaicSet([tmp_path / "mosaic.fits"], zeropoint=25.94), out
+
+
+def run_patch(lr_path, mosaic, out, **kw):
+    return pairs.process_patch(
+        lr_path, mosaic, out, size=4, factor=F, per_patch=6, rng=np.random.default_rng(0),
+        reject=["NO_DATA"], block_size=128, val_frac=0.3, **kw,
+    )  # fmt: skip
+
+
+def test_paper_units_keep_surface_brightness_and_convert_lsst_to_hsc_counts(tmp_path):
+    from neo.surveys.hst.mosaic import njy_per_count
+
+    lr_path, mosaic, out = paper_scene(tmp_path)
+    counts = run_patch(lr_path, mosaic, out, units="paper")
+    assert counts["train"] + counts["val"] == 6 and counts["filtered"] == 0
+    name = next((out / "train" / "hr").glob("*.fits")).name
+    hr = fits.open(out / "train" / "hr" / name)[0]
+    lr = fits.open(out / "train" / "lr" / name)[0]
+    # reproject_interp keeps e-/s per native pixel (the paper's HR convention)
+    assert np.allclose(hr.data, 0.05, rtol=1e-4)
+    hr_pixel, native = 0.2 / F, 0.03
+    assert np.isclose(hr.header["NJYPERPX"], mosaic.njy_per_count * (hr_pixel / native) ** 2)
+    assert np.isclose(hr.header["HRPIXNAT"], native) and hr.header["UNITS"] == "paper"
+    # LR: nJy per 0.2" px -> HSC counts (ZP 27) per 0.168" px of equal surface brightness
+    expected_lr = 10.0 * (0.168 / 0.2) ** 2 / njy_per_count(27.0)
+    assert np.allclose(lr.data, expected_lr, rtol=1e-5)
+    assert np.isclose(lr.data[0, 0] * lr.header["NJYPERPX"], 10.0, rtol=1e-5)
+    assert np.isclose(lr.header["NJYPERPX"], 81.55, rtol=2e-3)  # the factor quoted in the audit
+
+
+def test_paper_units_restate_any_mosaic_per_30mas_pixel(tmp_path):
+    lr_wcs = make_tan_wcs(0.2, (60, 60))
+    center = lr_wcs.pixel_to_world(29.5, 29.5)
+    lr_path, _, out = paper_scene(tmp_path)
+    coarse = make_tan_wcs(0.06, (210, 210), crval=(center.ra.deg, center.dec.deg))
+    write_mosaic(tmp_path / "m60.fits", np.full((210, 210), 0.2, np.float32), coarse)
+    run_patch(lr_path, MosaicSet([tmp_path / "m60.fits"], zeropoint=25.94), out, units="paper")
+    hr = fits.open(next((out / "train" / "hr").glob("*.fits")))[0]
+    assert np.allclose(hr.data, 0.2 / 4, rtol=1e-4)  # per 0.06" px -> per 0.03" px
+    assert np.isclose(hr.header["HRPIXNAT"], 0.06)
+
+
+def test_njy_units_stay_flux_conserving(tmp_path):
+    lr_path, mosaic, out = paper_scene(tmp_path)
+    run_patch(lr_path, mosaic, out)
+    hr = fits.open(next((out / "train" / "hr").glob("*.fits")))[0]
+    area = (0.2 / F / 0.03) ** 2
+    assert np.allclose(hr.data, 0.05 * area * mosaic.njy_per_count, rtol=1e-2)
+    assert hr.header["UNITS"] == "njy" and hr.header["NJYPERPX"] == 1.0
+
+
+def test_flux_filter_matches_the_papers_log_sum_cut(tmp_path):
+    lr_path, mosaic, out = paper_scene(tmp_path, hr_value=0.05)
+    # paper footprint: central round(24 * 0.84) = 20 HR px, x (0.0333/0.028)^2 -> 28.3, ln = 3.34
+    assert run_patch(lr_path, mosaic, out, units="paper", flux_filter=(2, 7))["filtered"] == 0
+    for p in out.glob("*/*/*.fits"):
+        p.unlink()
+    counts = run_patch(lr_path, mosaic, out, units="paper", flux_filter=(4, 7))
+    assert counts["filtered"] == 6 and counts["train"] == counts["val"] == 0
+    assert not any(out.glob("*/*/*.fits"))
+    with pytest.raises(ValueError, match="units paper"):
+        run_patch(lr_path, mosaic, out, flux_filter=(2, 7))
+
+
+def test_hr_sky_subtract_removes_a_pedestal_but_keeps_sources(tmp_path):
+    lr_path, _, out = paper_scene(tmp_path)
+    lr_wcs = make_tan_wcs(0.2, (60, 60))
+    center = lr_wcs.pixel_to_world(29.5, 29.5)
+    hr_wcs = make_tan_wcs(0.03, (420, 420), crval=(center.ra.deg, center.dec.deg))
+    sky = np.random.default_rng(0).normal(0.001, 0.002, (420, 420)).astype(np.float32)
+    sky[200:220, 200:220] += 1.0  # a source
+    write_mosaic(tmp_path / "m.fits", sky, hr_wcs)
+    mosaic = MosaicSet([tmp_path / "m.fits"], zeropoint=25.94)
+    counts = run_patch(lr_path, mosaic, out, units="paper", hr_sky_subtract=True)
+    assert np.isclose(counts["hr_sky"], 0.001, atol=3e-4) and counts["hr_sky_sigma"] > 0.2
+    hr = fits.open(next((out / "train" / "hr").glob("*.fits")))[0]
+    assert np.isclose(hr.header["HRSKYSUB"], counts["hr_sky"])
