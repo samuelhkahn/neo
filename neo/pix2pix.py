@@ -143,6 +143,7 @@ class Pix2Pix:
 
         return total_loss, adversarial_loss, recon_loss, vgg_loss, segmap_loss
 
+    @torch.no_grad()
     def generate_fake_images(self, conditioned_images, identity_map=False):
         """Generate super-resolved images from low-resolution inputs."""
         return self.gen(conditioned_images)
@@ -194,6 +195,7 @@ class Pix2Pix:
             self.gen_opt.step()
             return losses
 
+    @torch.no_grad()
     def validation_step(self, real, condition, hsc_hr, seg_map_real, optimizer):
         """Evaluate losses without updating model weights.
 
