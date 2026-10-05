@@ -196,3 +196,17 @@ def test_guard_refuses_checkpoints_from_another_pairs_build(tmp_path):
     manifest.write_manifest(pairs, [("train", "a", "x:1:3")])
     assert manifest.guard(config) == 1  # other build: refused
     assert manifest.main(["guard", str(config)]) == 1
+
+
+def test_build_id_changes_with_the_pairs_units(tmp_path):
+    from neo.preprocess.manifest import read_build
+
+    clean_scene(tmp_path)
+    assert leakage.main(["--pairs", str(tmp_path), "--apply"]) == 0
+    njy_build = read_build(tmp_path)
+    for p in tmp_path.glob("*/lr/*.fits"):
+        with fits.open(p, mode="update") as hdul:
+            hdul[0].header["UNITS"] = "paper"
+    assert leakage.main(["--pairs", str(tmp_path)]) == 1  # manifest now stale
+    assert leakage.main(["--pairs", str(tmp_path), "--apply"]) == 0
+    assert read_build(tmp_path) != njy_build
