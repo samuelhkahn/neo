@@ -14,6 +14,10 @@
 # Split: global Dec stripes (val = 2' of every 10', VAL_FRAC of the sky) with a 6" guard, so train and
 # val share no sky; then neo.preprocess.leakage verifies that on the written cutouts, quarantines
 # anything that still conflicts, and writes val/groups.csv for compare.py.
+# Units follow the NEO paper (--units paper), so its fixed log stretch sees the paper's values: HST
+# resampled with reproject_interp in e-/s per 0.03" pixel, sky pedestal removed (CANDELS was sky-
+# subtracted), LSST converted to HSC counts (ZP 27) per 0.168" pixel; NJYPERPX headers give nJy.
+# Saturated LSST windows are kept and no flux-sum filter is applied, as in the paper's training set.
 # Knobs: NEO_DATA (required), TRAIN_DENSITY (train windows per train pixel; 4 covers ~98% of the
 # train sky; ~3 MB per pair), VAL_FRAC, SEED.
 # Resumable: if the job dies or times out, submit it again with the same settings and it continues
@@ -39,6 +43,7 @@ uv run python -m neo.preprocess.pairs \
   --out "$PAIRS" \
   --split sky --val-frac "${VAL_FRAC:-0.2}" --val-period 10 --guard 6 \
   --train-density "${TRAIN_DENSITY:-4}" --val-tile --seed "${SEED:-0}" \
+  --units paper --hr-sky-subtract --reject NO_DATA \
   --parallel "${SLURM_CPUS_PER_TASK:-8}" --resume
 
 uv run python -m neo.preprocess.leakage --pairs "$PAIRS" --margin 5 --apply
