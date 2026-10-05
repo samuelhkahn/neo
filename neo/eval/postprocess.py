@@ -2,7 +2,10 @@
 
 Inverse of the training preprocessing in neo.data.dataset (center crop -> clip -> log scale -> pad):
 the 768 px output is cropped to its central 600 px (the 84 px reflection pad is removed) and the
-fixed log scaling (alpha = 1000, b = 1) is inverted, giving the HR image in the pairs' units (nJy).
+fixed log scaling (alpha = 1000, b = 1) is inverted, giving the HR image in the pairs' stored units.
+NJYPERPX in each cutout header (neo.preprocess.pairs) converts stored units to nJy per pixel:
+e-/s per 0.03" pixel (HR) and HSC counts per 0.168" pixel (LR) for --units paper pairs, 1.0 for
+nJy pairs (pairs built before the card existed are nJy).
 """
 
 import numpy as np
@@ -26,6 +29,22 @@ def to_physical(output: np.ndarray) -> np.ndarray:
     """(…, 768, 768) model output in log space -> (…, 600, 600) image in the HR pair units."""
     cropped = center_crop(np.asarray(output, dtype=np.float64), HR_SIZE)
     return SR_HST_HSC_Dataset.ds9_unscaling(cropped, a=LOG_SCALE_A, offset=LOG_SCALE_OFFSET)
+
+
+def njy_per_px(header) -> float:
+    """nJy per pixel per stored unit of a pair cutout (NJYPERPX; absent on nJy pairs)."""
+    return float(header.get("NJYPERPX", 1.0))
+
+
+def paper_clip(image: np.ndarray) -> np.ndarray:
+    """clip(x, 0, p99.999) of a centre crop, as the training dataset does before log scaling.
+
+    The paper measured HST and LR after the dataset round trip unscale(scale(clip(x))); the round
+    trip itself only adds float32 rounding (under 0.01 sky sigma per pixel on our pairs), so the
+    clip is applied directly.
+    """
+    data = np.asarray(image, dtype=np.float32)  # the dataset clips float32 cutouts
+    return SR_HST_HSC_Dataset.clip(data, use_data=False)[0].astype(np.float64)
 
 
 def subtract_background(image: np.ndarray) -> np.ndarray:
