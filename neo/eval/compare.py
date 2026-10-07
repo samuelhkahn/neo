@@ -12,7 +12,23 @@ per pixel: HR and LR cutouts are converted with their own NJYPERPX card (neo.pre
   gains.csv    per model: share of sources it improves over the LR image (paper's gain metric)
   pairwise.csv per model pair: share of sources where the first model is closer to HST
   table4.png   median bias with 95% CI per parameter and image set
+  realism.csv  per pair and model: SR detections, ghosts, HST sources recovered, sky excess,
+               detection settings
+  realism_sr.csv   every SR detection: centroid, flux, AB mag, ghost and relaxed-only flags, HST
+               flux and S/N under it
+  realism_hst.csv  every HST source: kron flux and AB mag, recovered or not by each model
+  realism_summary.csv / realism.md  per model: purity, ghosts per cutout and per arcmin^2 of sky,
+               completeness (overall and by HST kron mag), median sky excess, bootstrap 95% CIs
 All of it, with the run's parameters and each model's checkpoint, is tracked on Comet.
+
+Table 4 measures every image inside the HST segmentation map, so a source a model invents in
+empty sky (a "ghost") changes none of its numbers. The realism files (neo.eval.realism; skip with
+--no-realism) detect each SR image on its own with the same settings as HST and match its sources
+to HST's within --realism-margin (0.2"), with hysteresis (a counterpart counts down to half the
+threshold and a quarter of the minimum area, so flux and size biases near the cut do not read as
+ghosts or misses), for every pair, including those Table 4 drops. Their sky excess differences the
+images before default mode's background subtraction, and their intervals resample whole groups of
+overlapping cutouts when <split>/groups.csv exists.
 
 --subset select|report|all splits pairs deterministically (20% select / 80% report), so checkpoint
 selection and the reported numbers never use the same pairs. With <split>/groups.csv (written by
@@ -45,13 +61,14 @@ from astropy.io import fits  # noqa: E402
 from astropy.wcs import WCS  # noqa: E402
 from astropy.wcs.utils import proj_plane_pixel_scales  # noqa: E402
 
-from neo.eval import metrics  # noqa: E402
+from neo.eval import metrics, realism  # noqa: E402
 from neo.eval.catalogs import (  # noqa: E402
     KERNEL_FWHM,
     NPIXELS,
     PAPER_LR_PIXEL_ARCSEC,
     catalog_set,
     default_threshold,
+    detect_hst,
     paper_fwhm,
     paper_npixels,
 )
@@ -98,20 +115,38 @@ def load_cutout(path: Path, size: int, paper_mode: bool):
     return np.asarray(crop, dtype=np.float64) * njy_per_px(header), header
 
 
+def failure(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
 def process(job):
+    """One pair's Table-4 catalogs: (name, catalog_set result or None, error or None, settings)."""
+    return process_pair(job)[:4]
+
+
+def process_pair(job):
+    """One pair, run in a worker: process's four values plus its realism record (None when
+    opts["realism"] is off, {"error": ...} if it failed).
+
+    HST is detected once and that detection serves both catalog_set and neo.eval.realism, which
+    detects each SR image on its own with the same settings. Realism is recorded for every pair,
+    also those catalog_set drops (no HST source, or an LR source count unlike HST's). Its sky
+    excess differences the images before default mode's background subtraction, which would
+    take out flux a model spreads over the SEP mesh.
+    """
     name, split, preds, opts = job
     warnings.simplefilter("ignore")
     paper = opts["paper_mode"]
-    hst, hr_header = load_cutout(split / "hr" / name, HR_SIZE, paper)
+    hst_raw, hr_header = load_cutout(split / "hr" / name, HR_SIZE, paper)
     lr, lr_header = load_cutout(split / "lr" / name, LR_SIZE, paper)
-    if not paper:
-        hst = subtract_background(hst)
+    hst = hst_raw if paper else subtract_background(hst_raw)
     rng = np.random.default_rng(int(hashlib.md5(name.encode()).hexdigest(), 16) % 2**32)
-    srs = {}
+    srs, srs_raw = {}, {}
     for model, directory in preds.items():
         sr = np.asarray(fits.getdata(directory / name), dtype=np.float64)  # nJy (predict.py)
         if opts["balance_noise"]:
             sr = balance_noise(sr, rng=rng)
+        srs_raw[model] = sr
         srs[model] = sr if paper else subtract_background(sr)
     settings = {
         "threshold": threshold_for(hr_header, opts["threshold"], opts["nsigma"], hst),
@@ -123,11 +158,35 @@ def process(job):
         settings["npixels"] = paper_npixels(pixel_arcsec(hr_header))
         settings["fwhm"] = paper_fwhm(pixel_arcsec(hr_header))
         settings["lr_fwhm"] = paper_fwhm(pixel_arcsec(lr_header), PAPER_LR_PIXEL_ARCSEC)
+    detect = (settings["threshold"], settings["npixels"], settings["fwhm"])
     try:
-        result = catalog_set(hst, srs, lr, factor=opts["factor"], **settings)
+        detected = detect_hst(hst, *detect)
     except Exception as exc:  # noqa: BLE001 - one bad cutout must not stop the run
-        return name, None, f"{type(exc).__name__}: {exc}", settings
-    return name, result, None, settings
+        found = {"error": failure(exc)} if opts.get("realism") else None
+        return name, None, failure(exc), settings, found
+    found = None
+    if opts.get("realism"):
+        try:
+            found = realism.measure_pair(
+                name,
+                hst,
+                srs,
+                detected,
+                *detect,
+                pixel_arcsec(hr_header),
+                opts["margin"],
+                hst_raw=hst_raw,
+                srs_raw=srs_raw,
+            )
+        except Exception as exc:  # noqa: BLE001
+            found = {"error": failure(exc)}
+    try:
+        result = None  # catalog_set gives None without HST sources
+        if detected is not None:
+            result = catalog_set(hst, srs, lr, factor=opts["factor"], detected=detected, **settings)
+    except Exception as exc:  # noqa: BLE001
+        return name, None, failure(exc), settings, found
+    return name, result, None, settings, found
 
 
 def per_source_rows(name, hst_tbl, sr_tbls, lr_tbl, factor, paper_mode=False):
@@ -284,6 +343,8 @@ def track(
     checkpoints,
     used,
     paper_q,
+    realism_summary=None,
+    realism_failed=0,
 ):
     mode = "paper" if args.paper_mode else "default"
     experiment = start_experiment(
@@ -342,7 +403,42 @@ def track(
     experiment.log_asset(str(out / "table4.md"))
     experiment.log_text((out / "table4.md").read_text())
     experiment.log_figure(figure_name="table4 median bias", figure=fig)
+    experiment.log_parameters(
+        {
+            "realism": realism_summary is not None,
+            "realism_margin_arcsec": args.realism_margin,
+            "realism_relaxed_threshold_factor": realism.RELAX_THRESHOLD,
+            "realism_relaxed_npixels_factor": realism.RELAX_NPIXELS,
+            "realism_failed_pairs": realism_failed,
+        }
+    )
+    for s in realism_summary or []:
+        for stat, v in s["stats"].items():
+            for k, suffix in (("value", ""), ("ci_lo", "_ci_lo"), ("ci_hi", "_ci_hi")):
+                if np.isfinite(v[k]):
+                    experiment.log_metric(f"{s['model']}/realism/{stat}{suffix}", v[k])
+    if realism_summary is not None:
+        for fname in realism.FILES:
+            experiment.log_table(str(out / fname))
+        experiment.log_asset(str(out / "realism.md"))
+        experiment.log_text((out / "realism.md").read_text())
     experiment.end()
+
+
+def realism_report(args, out, found, preds, groups, used, checkpoints, n_failed=0) -> list:
+    """Write the realism files (module docstring) and print realism.md; returns the summary."""
+    mode = "paper" if args.paper_mode else "default"
+    intro = [
+        f"# Source realism ({args.subset} subset, {mode} mode)",
+        "",
+        *mode_lines(args, used),
+        *prediction_lines(args, checkpoints),
+    ]
+    summary, lines = realism.write_report(
+        out, found, list(preds), groups, intro, args.realism_margin, n_failed
+    )
+    print("\n".join(lines))
+    return summary
 
 
 def column(rows, key, mask=None):
@@ -380,6 +476,19 @@ def parse_args(argv=None) -> argparse.Namespace:
         f"(default {DEFAULT_MIN_ELLIPTICITY})",
     )
     parser.add_argument("--balance-noise", action="store_true", help="refill zeros in SR outputs")
+    parser.add_argument(
+        "--no-realism",
+        action="store_true",
+        help="skip the source-realism check (ghosts, completeness, sky excess; neo.eval.realism)",
+    )
+    parser.add_argument(
+        "--realism-margin",
+        type=float,
+        default=realism.MARGIN_ARCSEC,
+        metavar="ARCSEC",
+        help="SR sources further than this from every HST segment, at the full or the relaxed "
+        f'cut, are ghosts (default {realism.MARGIN_ARCSEC:g}")',
+    )
     parser.add_argument("--tag", action="append", default=[], help="extra Comet tag (repeatable)")
     parser.add_argument("--no-comet", action="store_true", help="do not track the run on Comet")
     return parser.parse_args(argv)
@@ -411,6 +520,8 @@ def main(argv=None) -> None:
         preds[model] = Path(directory)
     if LR_KEY in preds:
         raise SystemExit(f"'{LR_KEY}' is reserved for the low-resolution baseline")
+    if args.realism_margin < 0:
+        raise SystemExit("--realism-margin must be at least 0")
     groups = load_groups(split)
     if args.subset != "all" and not groups:
         print(f"no {split / 'groups.csv'}: assigning {args.subset} by name, not by sky group")
@@ -431,18 +542,28 @@ def main(argv=None) -> None:
         "nsigma": args.nsigma,
         "balance_noise": args.balance_noise,
         "paper_mode": args.paper_mode,
+        "realism": not args.no_realism,
+        "margin": args.realism_margin,
     }
     mode = "paper" if args.paper_mode else "default"
     print(f"{len(names)} pairs ({args.subset}, {mode} mode) x models {list(preds)}")
 
     rows, kept, t0 = [], 0, time.time()
     used = {"threshold": [], "npixels": [], "fwhm": [], "lr_fwhm": []}
+    found = {"pairs": [], "sr": [], "hst": []}  # realism records of every pair
+    realism_failed = []
     jobs = [(n, split, preds, opts) for n in names]
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
-        results = pool.map(process, jobs, chunksize=4)
-        for k, (name, result, error, settings) in enumerate(results, 1):
+        results = pool.map(process_pair, jobs, chunksize=4)
+        for k, (name, result, error, settings, record) in enumerate(results, 1):
             for key, value in settings.items():
                 used[key].append(value)
+            if record is not None and "error" in record:
+                print(f"  {name}: realism: {record['error']}")
+                realism_failed.append(name)
+            elif record is not None:
+                for key, items in found.items():
+                    items.extend(record[key])
             if error:
                 print(f"  {name}: {error}")
             elif result is not None:
@@ -453,10 +574,17 @@ def main(argv=None) -> None:
                 print(
                     f"  {k}/{len(jobs)} pairs, {kept} kept, {len(rows)} sources ({elapsed:.0f} s)"
                 )
+    out = Path(args.out)
+    realism_summary = None
+    if not args.no_realism and len(realism_failed) == len(names):
+        print(f"\nWARNING: source realism failed on all {len(names)} pairs; no realism files")
+    elif not args.no_realism:  # before the check below: a pure-sky subset still has a ghost rate
+        realism_summary = realism_report(
+            args, out, found, preds, groups, used, checkpoints, len(realism_failed)
+        )
     if not rows:
         raise SystemExit("no sources survived cataloging")
 
-    out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     with open(out / "sources.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
@@ -613,6 +741,8 @@ def main(argv=None) -> None:
             checkpoints,
             used,
             paper_q,
+            realism_summary,
+            len(realism_failed),
         )
     plt.close(fig)
     print(f"\nreport written to {out}")

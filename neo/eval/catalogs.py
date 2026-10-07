@@ -161,6 +161,7 @@ def catalog_set(
     npixels: int = NPIXELS,
     fwhm: float = KERNEL_FWHM,
     lr_fwhm: float | None = None,
+    detected=None,
 ):
     """Catalog one cutout set; returns (hst_table, {model: table}, lr_table) or None.
 
@@ -168,8 +169,11 @@ def catalog_set(
     SR shapes come from images smoothed with `fwhm`; LR shapes from the LR image itself, or from
     its copy smoothed with `lr_fwhm` (as the code behind the paper's Table 4 did). As in the
     paper, a set is kept only when the reprojected LR catalog has as many sources as HST.
+    `detected` is detect_hst(hst, threshold, npixels, fwhm) when the caller already ran it
+    (compare.py detects each HST cutout once, for these catalogs and neo.eval.realism).
     """
-    detected = detect_hst(hst, threshold, npixels, fwhm)
+    if detected is None:
+        detected = detect_hst(hst, threshold, npixels, fwhm)
     if detected is None:
         return None
     segm, convolved = detected
