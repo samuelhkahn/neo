@@ -467,3 +467,15 @@ def test_focus_configs_differ_from_baseline_only_in_focus(arm, mask):
     section.read(CONFIGS / f"lux_diffusion_{arm}.ini")
     focus_options = diffusion.SourceFocus.from_section(section["DIFFUSION"])
     assert focus_options.object_mask == mask and focus_options.source_crop_frac == 0.5
+
+
+def test_draws_in_chunks_are_independent_samples_of_one_image():
+    model = small_model()
+    cond = torch.rand(1, 1, 768, 768) * 2 - 1
+    torch.manual_seed(4)
+    out = diffusion.draws(model, cond, 5, steps=2, chunk=2)
+    assert out.shape == (5, 1, 768, 768) and out.device.type == "cpu"
+    w0, w1 = diffusion.WINDOW_START, diffusion.WINDOW_START + diffusion.WINDOW
+    window = out[..., w0:w1, w0:w1].flatten(1)
+    assert len({tuple(r[:8].tolist()) for r in window}) == 5  # every draw differs
+    assert torch.equal(out[:, :, :w0], cond.expand(5, -1, -1, -1)[:, :, :w0])

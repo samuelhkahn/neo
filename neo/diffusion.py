@@ -158,6 +158,20 @@ def super_resolve(model: EDM, cond, steps=18):
     return out
 
 
+@torch.no_grad()
+def draws(model: EDM, cond, k, steps=18, chunk=8):
+    """k independent samples (k, 1, 768, 768) of one conditioning image cond (1, 1, 768, 768).
+
+    Sampled `chunk` at a time (each a batch of copies of cond) so a large k fits in GPU memory,
+    and returned on the CPU.
+    """
+    out = []
+    for start in range(0, k, chunk):
+        n = min(chunk, k - start)
+        out.append(super_resolve(model, cond.repeat(n, 1, 1, 1), steps).cpu())
+    return torch.cat(out)
+
+
 def crop_offsets(n, size, mask=None, source_frac=0.0, generator=None):
     """(n, 2) top-left (y, x) offsets of size px crops inside the sampling window (CPU, int64).
 

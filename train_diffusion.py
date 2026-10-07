@@ -161,7 +161,8 @@ def main():
     p_std = dcfg.getfloat("p_std", 1.2)
     sample_steps = dcfg.getint("sample_steps", 18)
     sample_every = dcfg.getint("sample_every", 5000)
-    stack_samples = dcfg.getint("stack_samples", 8)
+    stack_sizes = stack.parse_sizes(dcfg.get("stack_samples", "8"))
+    stack_chunk = dcfg.getint("stack_chunk", 8)
     stats_batches = dcfg.getint("stats_batches", 50)
     # Source focus (neo/diffusion.py SourceFocus): object-weighted loss, source-centred crops
     focus = diffusion.SourceFocus.from_section(dcfg)
@@ -361,27 +362,39 @@ def main():
                         step=cur_step,
                     )
 
-                    # One draw vs the mean and median of stack_samples draws of the same val image
-                    # (neo/eval/stack.py): features in one draw but not the median are invented
-                    if stack_samples > 1:
-                        cond_k = hsc_hr_val[:1].repeat(stack_samples, 1, 1, 1)
-                        draws = diffusion.super_resolve(ema.model, cond_k, sample_steps).cpu()
-                        stacked = stack.stack(draws)
-                        for kind in stack.IMAGES:
-                            val_metrics[f"L1 Val {kind} of {stack_samples}"] = stack.l1(
-                                stacked[kind][0].numpy(), hr_val.numpy()
+                    # One draw vs the mean and median of k draws of the same val image, for each
+                    # stack size k in stack_samples (neo/eval/stack.py): all sizes come from one set
+                    # of max(k) draws (the first k of them). Features in one draw but not the median
+                    # are invented; the convergence figure shows the stacks settling as k grows.
+                    if stack_sizes:
+                        k_max = stack_sizes[-1]
+                        draws = diffusion.draws(
+                            ema.model, hsc_hr_val[:1], k_max, sample_steps, stack_chunk
+                        )
+                        hr_np = hr_val.numpy()
+                        val_metrics["L1 Val single"] = stack.l1(draws[0, 0].numpy(), hr_np)
+                        stacks = {}
+                        for k in stack_sizes:
+                            stacked = stack.stack(draws[:k])
+                            stacks[k] = {kind: v[0].numpy() for kind, v in stacked.items()}
+                            for kind in ("mean", "median"):
+                                val_metrics[f"L1 Val {kind} of {k}"] = stack.l1(
+                                    stacks[k][kind], hr_np
+                                )
+                        figures = {
+                            "Single vs Stacked Samples": stack.stack_figure(
+                                f"step {cur_step}", lr_val_img.numpy(), hr_np, stacks[k_max], k_max
                             )
-                        fig = stack.stack_figure(
-                            f"step {cur_step}",
-                            lr_val_img.numpy(),
-                            hr_val.numpy(),
-                            {k: v[0].numpy() for k, v in stacked.items()},
-                            stack_samples,
-                        )
-                        experiment.log_figure(
-                            figure_name="Single vs Stacked Samples", figure=fig, step=cur_step
-                        )
-                        plt.close(fig)
+                        }
+                        if len(stack_sizes) > 1:
+                            figures["Stack Convergence"] = stack.convergence_figure(
+                                f"step {cur_step}", hr_np, draws[0, 0].numpy(), stacks
+                            )
+                        for figure_name, fig in figures.items():
+                            experiment.log_figure(
+                                figure_name=figure_name, figure=fig, step=cur_step
+                            )
+                            plt.close(fig)
 
                     # The masks of the first val image, to check by eye that they sit on sources
                     if focus.enabled:
