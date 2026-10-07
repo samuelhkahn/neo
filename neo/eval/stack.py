@@ -56,6 +56,11 @@ def stack(draws: torch.Tensor) -> dict:
     }
 
 
+def parse_sizes(value) -> list:
+    """Stack sizes from a config value such as "8" or "8,16,32"; sizes below 2 are dropped."""
+    return sorted({int(v) for v in str(value).split(",") if v.strip() and int(v) > 1})
+
+
 def l1(image, hr) -> float:
     """Log-space L1 against the HR target over the central 600 px (predict.py's L1LOG)."""
     return float(np.mean(np.abs(center_crop(image, HR_SIZE) - center_crop(hr, HR_SIZE))))
@@ -100,4 +105,36 @@ def stack_figure(name, lr, hr, stacked, k):
         ax.set_xticks([])
         ax.set_yticks([])
     fig.suptitle(f"{name}: one draw vs stacks of {k} draws")
+    return fig
+
+
+def convergence_figure(name, hr, single, stacks):
+    """How the stacks settle as draws are added: residuals against HST, central 600 px.
+
+    Columns: one draw, then each stack size k in `stacks` ({k: stack(first k draws)}); rows:
+    mean - HST and median - HST (the first column shows single - HST in both). All panels share
+    one symmetric scale, so draw-to-draw noise shrinking (about 1/sqrt(k)) and ghosts dropping out
+    of the median are visible directly; titles give the log-space L1.
+    """
+    hst = center_crop(np.asarray(hr, dtype=np.float64), HR_SIZE)
+    sizes = sorted(stacks)
+    one = ("one draw", center_crop(np.asarray(single, np.float64), HR_SIZE))
+    panels = {(0, 0): one, (1, 0): one}
+    for j, k in enumerate(sizes, start=1):
+        for i, kind in enumerate(("mean", "median")):
+            img = center_crop(np.asarray(stacks[k][kind], np.float64), HR_SIZE)
+            panels[i, j] = (f"{kind} of {k}", img)
+    diffs = {key: img - hst for key, (_, img) in panels.items()}
+    lim = max(np.percentile(np.abs(d), 99.5) for d in diffs.values()) or 1.0
+
+    ncol = len(sizes) + 1
+    fig, axes = plt.subplots(2, ncol, figsize=(4.4 * ncol + 1, 9.2), layout="constrained")
+    for (i, j), (title, _) in panels.items():
+        im = axes[i, j].imshow(diffs[i, j], origin="lower", cmap="bwr_r", vmin=-lim, vmax=lim)
+        axes[i, j].set_title(f"{title} - HST   L1 {np.mean(np.abs(diffs[i, j])):.4f}")
+    for ax in axes.flat:
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.colorbar(im, ax=axes, shrink=0.8, label="log-space difference")
+    fig.suptitle(f"{name}: stacks of more draws")
     return fig
