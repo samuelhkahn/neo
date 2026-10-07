@@ -19,10 +19,13 @@
 # GEN_MODE=train runs the generator as the paper generated its SR images: never put in eval mode
 # (dropout on, batch norm on each image's own statistics) at batch size 1, so BATCH is forced to 1
 # (as the paper's neo/analysis/generate_sr_images.py did). Default eval: deterministic.
-# Output: $NEO_DATA/predictions/<MODEL>/<run>/<checkpoint>/<SPLIT>-<SUBSET>[-gentrain] (printed
-# below), in nJy per HR pixel.
+# SAMPLES=K (K > 1; diffusion, or GEN_MODE=train) draws K samples per pair and writes the first
+# draw and the stacks of all K as single/, mean/, median/ (each a directory for compare.sbatch) and
+# std/ (per-pixel spread) under the output directory (neo/eval/stack.py); K times slower.
+# Output: $NEO_DATA/predictions/<MODEL>/<run>/<checkpoint>/<SPLIT>-<SUBSET>[-gentrain][-k<K>]
+# (printed below), in nJy per HR pixel.
 # Knobs: CONFIG, MODEL, CKPT (required), SUBSET (select|report|all), SPLIT (default val), LIMIT, BATCH,
-# GEN_MODE (eval|train).
+# GEN_MODE (eval|train), SAMPLES (default 1).
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 export PATH="$HOME/.local/bin:$PATH"
@@ -43,12 +46,15 @@ case "$GEN_MODE" in
     BATCH=1; SUFFIX="-gentrain" ;;
   *) echo "GEN_MODE must be eval or train, not $GEN_MODE" >&2; exit 1 ;;
 esac
+SAMPLES="${SAMPLES:-1}"
+if [ "$SAMPLES" -gt 1 ]; then SUFFIX="$SUFFIX-k$SAMPLES"; fi
 OUT="$NEO_DATA/predictions/$MODEL/$(basename "$(dirname "$CKPT")")/$(basename "$CKPT" .pt)/$SPLIT-$SUBSET$SUFFIX"
-echo "predictions -> $OUT (generator mode $GEN_MODE, batch $BATCH)"
+echo "predictions -> $OUT (generator mode $GEN_MODE, batch $BATCH, $SAMPLES draw(s) per pair)"
+if [ "$SAMPLES" -gt 1 ]; then echo "  stacks: $OUT/{single,mean,median,std}"; fi
 
 nvidia-smi --query-gpu=name,memory.total --format=csv
 uv run python -m neo.eval.predict \
   --config "$CONFIG" --checkpoint "$CKPT" \
   --split-dir "$NEO_DATA/pairs/cosmos_web_i/$SPLIT" \
   --subset "$SUBSET" --out "$OUT" --gen-mode "$GEN_MODE" \
-  --batch-size "$BATCH" ${LIMIT:+--limit "$LIMIT"}
+  --batch-size "$BATCH" --samples "$SAMPLES" ${LIMIT:+--limit "$LIMIT"}
