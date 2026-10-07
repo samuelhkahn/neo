@@ -282,6 +282,13 @@ def lr_detection(cond, nsigma=4.5, smooth=1.0):
     return flux.to(cond.device), threshold.to(cond.device)
 
 
+def drop_isolated(detected):
+    """Detections (B, 1, h, w) 0/1 without the pixels that have fewer than MIN_CLUSTER detected
+    pixels in their 3 x 3 neighbourhood (themselves included; zero beyond the edge)."""
+    count = F.avg_pool2d(detected, 3, stride=1, padding=1, count_include_pad=True) * 9
+    return detected * (count > MIN_CLUSTER - 0.5)
+
+
 @torch.no_grad()
 def lr_source_mask(cond, nsigma=4.5, smooth=1.0, dilate=2):
     """Binary (B, 1, 768, 768) float32 mask of the sources detected in the LR image.
@@ -307,9 +314,7 @@ def lr_source_mask(cond, nsigma=4.5, smooth=1.0, dilate=2):
     cluster cut flagged 2.3% (about 16% of its mask), at 3-7 sigma depending on the field.
     """
     flux, threshold = lr_detection(cond, nsigma, smooth)
-    detected = (flux > threshold).float()
-    count = F.avg_pool2d(detected, 3, stride=1, padding=1, count_include_pad=True) * 9
-    detected = detected * (count > MIN_CLUSTER - 0.5)
+    detected = drop_isolated((flux > threshold).float())
     if dilate > 0:
         detected = F.max_pool2d(detected, 2 * dilate + 1, stride=1, padding=dilate)
     mask = torch.zeros(cond.shape, dtype=torch.float32, device=cond.device)

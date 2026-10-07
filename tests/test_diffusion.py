@@ -210,18 +210,24 @@ def real_like_sky(n, seed=0, n_sources=12):
 
 
 def test_lr_source_mask_noise_rate():
-    """lr_source_mask's documented noise rate (2.3% of the area after dilation on 50 real train
-    cutouts) on a real-like sky: each image's threshold applied to the image reflected about its
-    sky level, which clips the sources away and keeps the noise's distribution. White noise about
-    0 is not enough: the positive sky and the correlated noise both raise the rate."""
+    """lr_source_mask's documented noise rate (0.03% of the area on 50 real train cutouts) on a
+    real-like sky: each image's threshold applied to the image reflected about its sky level,
+    which clips the sources away and keeps the noise's distribution, then the mask's cluster cut
+    and dilation. White noise about 0 is not enough: the positive sky and the correlated noise
+    both raise the rate."""
     level, lr = real_like_sky(24)
     real = hsc_hr_from_lr(lr)
     _, threshold = diffusion.lr_detection(real)
     noise, _ = diffusion.lr_detection(hsc_hr_from_lr(2 * level - lr))
-    flagged = F.max_pool2d((noise > threshold).float(), 5, stride=1, padding=2)  # dilate = 2
+    for scale, bound in ((1.0, 0.002), (0.9, None)):
+        detected = diffusion.drop_isolated((noise > scale * threshold).float())
+        flagged = F.max_pool2d(detected, 5, stride=1, padding=2).mean()  # dilate = 2
+        if bound is not None:
+            assert flagged < bound  # 0.07% here
+        else:
+            assert flagged > 0.002  # 0.3%: thresholds 10% lower already exceed the bound
     coverage = diffusion.lr_source_mask(real)[..., 84:684, 84:684].mean()
-    assert 0.10 < coverage < 0.20  # as on real cutouts (14%), so the threshold is comparable
-    assert flagged.mean() < 0.025  # 1.5% here; thresholds 10% lower already exceed the bound
+    assert 0.10 < coverage < 0.20  # as on real cutouts (12.5%), so the threshold is comparable
 
 
 def test_lr_source_mask_registration():
