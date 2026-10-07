@@ -16,6 +16,7 @@ import configparser
 import os
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from comet_ml import Experiment, OfflineExperiment
@@ -26,6 +27,7 @@ from neo import diffusion
 from neo.data.augment import dataset_classes
 from neo.data.collate_fn import collate_fn
 from neo.data.dataset import SR_HST_HSC_Dataset
+from neo.eval import stack
 from neo.log_figure import log_figure
 
 
@@ -130,6 +132,7 @@ def main():
     p_std = dcfg.getfloat("p_std", 1.2)
     sample_steps = dcfg.getint("sample_steps", 18)
     sample_every = dcfg.getint("sample_every", 5000)
+    stack_samples = dcfg.getint("stack_samples", 8)
     stats_batches = dcfg.getint("stats_batches", 50)
 
     # Comet ML experiment tracking; logs locally when no API key is set
@@ -296,6 +299,28 @@ def main():
                         lims=[-vmax, vmax],
                         step=cur_step,
                     )
+
+                    # One draw vs the mean and median of stack_samples draws of the same val image
+                    # (neo/eval/stack.py): features in one draw but not the median are invented
+                    if stack_samples > 1:
+                        cond_k = hsc_hr_val[:1].repeat(stack_samples, 1, 1, 1)
+                        draws = diffusion.super_resolve(ema.model, cond_k, sample_steps).cpu()
+                        stacked = stack.stack(draws)
+                        for kind in stack.IMAGES:
+                            val_metrics[f"L1 Val {kind} of {stack_samples}"] = stack.l1(
+                                stacked[kind][0].numpy(), hr_val.numpy()
+                            )
+                        fig = stack.stack_figure(
+                            f"step {cur_step}",
+                            lr_val_img.numpy(),
+                            hr_val.numpy(),
+                            {k: v[0].numpy() for k, v in stacked.items()},
+                            stack_samples,
+                        )
+                        experiment.log_figure(
+                            figure_name="Single vs Stacked Samples", figure=fig, step=cur_step
+                        )
+                        plt.close(fig)
 
                 experiment.log_metrics(val_metrics, step=cur_step)
 
