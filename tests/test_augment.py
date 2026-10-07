@@ -13,6 +13,7 @@ from astropy.io import fits
 
 from neo.data.augment import (
     Paper8BitMixin,
+    Rot90Dataset,
     ShiftD4Dataset,
     ShiftDataset,
     dataset_classes,
@@ -25,7 +26,12 @@ from neo.data.dataset import SR_HST_HSC_Dataset
 
 PAD_HR, PAD_LR = 84, 14  # the dataset's reflect padding around the 600 / 100 px crops
 CONFIGS = Path(__file__).resolve().parents[1] / "neo" / "configs"
-AUGMENTS = {"none": SR_HST_HSC_Dataset, "shift": ShiftDataset, "shift_d4": ShiftD4Dataset}
+AUGMENTS = {
+    "none": SR_HST_HSC_Dataset,
+    "shift": ShiftDataset,
+    "shift_d4": ShiftD4Dataset,
+    "rot90": Rot90Dataset,
+}
 
 
 def write_pairs(root, n=2, seed=0):
@@ -167,6 +173,32 @@ def test_shift_mode_stays_registered(tmp_path):
         hy, hx = peak(hst[PAD_HR:-PAD_HR, PAD_HR:-PAD_HR])
         assert (ly, lx) == (y0 + dy, x0 + dx)  # a pure translation of the crop
         assert (hy // 6, hx // 6) == (ly, lx)
+        assert peak(hsc_hr[PAD_HR:-PAD_HR, PAD_HR:-PAD_HR]) == (ly * 6, lx * 6)
+
+
+def test_rot90_mode_only_rotates(tmp_path):
+    write_pairs(tmp_path, n=1)
+    aug = make(Rot90Dataset, tmp_path)
+    random.seed(0)
+    draws = [aug.draw() for _ in range(2000)]
+    assert {(dy, dx, flip) for dy, dx, _, flip in draws} == {(0, 0, False)}
+    assert {k for _, _, k, _ in draws} == {0, 1, 2, 3}
+
+
+def test_rot90_mode_rotates_the_centre_crop_and_stays_registered(tmp_path):
+    write_pairs(tmp_path, n=1)
+    plain, aug = make(SR_HST_HSC_Dataset, tmp_path), make(Rot90Dataset, tmp_path)
+    y0, x0 = peak(plain[0][1][PAD_LR:-PAD_LR, PAD_LR:-PAD_LR])
+    for k in range(4):
+        aug.draw = lambda k=k: (0, 0, k, False)
+        hst, hsc, hsc_hr, _ = aug[0]
+        ly, lx = peak(hsc[PAD_LR:-PAD_LR, PAD_LR:-PAD_LR])
+        marker = np.zeros((100, 100))
+        marker[y0, x0] = 1
+        rotated = shift_d4(np.pad(marker, 21), 0, 0, k, False)[21:121, 21:121]
+        assert (ly, lx) == tuple(int(v) for v in np.argwhere(rotated)[0])
+        hy, hx = peak(hst[PAD_HR:-PAD_HR, PAD_HR:-PAD_HR])
+        assert (hy // 6, hx // 6) == (ly, lx)  # HR peak inside the LR peak's 6x6 block
         assert peak(hsc_hr[PAD_HR:-PAD_HR, PAD_HR:-PAD_HR]) == (ly * 6, lx * 6)
 
 
