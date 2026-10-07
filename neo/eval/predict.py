@@ -21,6 +21,12 @@ Each output records its checkpoint (NEORUN, NEOCKPT, NEOSTEP), generator mode (N
 stops the run unless --overwrite is given, so predictions from another checkpoint, mode or pairs
 build cannot be mixed in. The run is tracked on Comet (neo.eval.tracking): parameters, the
 config, per-pair L1, example images, predictions.csv.
+
+--samples K (K > 1, stochastic models only: diffusion, or a GAN with --gen-mode train) draws K
+samples per pair and writes <out>/single, <out>/mean, <out>/median (each a predictions directory
+for compare.py, with its own predictions.csv) and <out>/std (per-pixel spread of the draws, nJy);
+see neo.eval.stack. Their files also record NEOSTACK (which stack) and NEOSAMPL (K), and the
+example figures compare one draw with the stacks.
 """
 
 import argparse
@@ -39,6 +45,7 @@ from astropy.io import fits  # noqa: E402
 from astropy.wcs import WCS  # noqa: E402
 
 from neo.data.dataset import SR_HST_HSC_Dataset  # noqa: E402
+from neo.eval import stack  # noqa: E402
 from neo.eval.postprocess import (  # noqa: E402
     HR_SIZE,
     LR_SIZE,
@@ -106,6 +113,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--subset", choices=SUBSETS, default="all", help="val pairs to predict (module docstring)"
     )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=1,
+        help="draws per pair; K > 1 writes single/mean/median/std stacks (module docstring)",
+    )
     parser.add_argument("--overwrite", action="store_true", help="replace existing predictions")
     parser.add_argument("--tag", action="append", default=[], help="extra Comet tag (repeatable)")
     parser.add_argument("--no-comet", action="store_true", help="do not track the run on Comet")
@@ -116,6 +129,8 @@ def main(argv=None) -> None:
     args = parse_args(argv)
     if args.gen_mode == "train" and args.batch_size != 1:
         raise SystemExit("--gen-mode train uses batch statistics: use --batch-size 1")
+    if args.samples < 1:
+        raise SystemExit("--samples must be at least 1")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = pick_device(args.device)
@@ -132,15 +147,29 @@ def main(argv=None) -> None:
         data_aug=False,
         experiment=None,
     )
+    model = generator_name(config)
+    if args.samples > 1 and model != "diffusion" and args.gen_mode == "eval":
+        raise SystemExit(
+            f"--samples {args.samples}: the {model} generator in eval mode is deterministic, so "
+            "every draw would be the same (use --gen-mode train for dropout draws)"
+        )
     groups = load_groups(split)
     order = sorted(range(len(dataset)), key=lambda i: dataset.filenames[i])
     order = [i for i in order if in_subset(dataset.filenames[i], args.subset, groups)][: args.limit]
     out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
+    kinds = stack.KINDS if args.samples > 1 else (None,)  # None: one draw, written to out itself
+    dirs = {kind: out / kind if kind else out for kind in kinds}
+    for directory in dirs.values():
+        directory.mkdir(parents=True, exist_ok=True)
+
+    def stack_cards(kind):
+        if kind is None:
+            return {}
+        return {"NEOSTACK": kind, "NEOSAMPL": args.samples}
+
     predict = build_predictor(config, args.checkpoint, device, mode=args.gen_mode)
     print(f"device {device} | {len(order)} pairs from {split} -> {out}")
 
-    model = generator_name(config)
     identifier = config.get("IDENTIFIER", "identifier", fallback="").strip('"')
     checkpoint = Path(args.checkpoint)
     state = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
@@ -172,27 +201,33 @@ def main(argv=None) -> None:
                 "batch_size": args.batch_size,
                 "seed": args.seed,
                 "gen_mode": args.gen_mode,
+                "samples": args.samples,
                 "device": device,
             }
         )
         experiment.log_asset(args.config)
 
-    rows, t0 = [], time.time()
+    scored = [k for k in kinds if k != "std"]
+    rows, n_done, t0 = {k: [] for k in scored}, 0, time.time()
     for start in range(0, len(order), args.batch_size):
         batch = []
         for i in order[start : start + args.batch_size]:
             name = dataset.filenames[i]
             hr_header = fits.getheader(split / "hr" / name)
-            expected = {**source, "BUNIT": "nJy", "PAIRID": pair_id(hr_header)}
-            if (out / name).exists() and not args.overwrite:
-                header = fits.getheader(out / name)
-                differs = {k: header.get(k) for k, v in expected.items() if header.get(k) != v}
-                if differs:
-                    raise SystemExit(
-                        f"{out / name} exists but came from {differs}, not {expected}: predict "
-                        "into a new --out (or pass --overwrite)"
-                    )
-                continue
+            existing = [k for k in kinds if (dirs[k] / name).exists()]
+            if existing and not args.overwrite:
+                for kind in existing:
+                    expected = {**source, "BUNIT": "nJy", "PAIRID": pair_id(hr_header)}
+                    expected.update(stack_cards(kind))
+                    header = fits.getheader(dirs[kind] / name)
+                    differs = {k: header.get(k) for k, v in expected.items() if header.get(k) != v}
+                    if differs:
+                        raise SystemExit(
+                            f"{dirs[kind] / name} exists but came from {differs}, not {expected}: "
+                            "predict into a new --out (or pass --overwrite)"
+                        )
+                if len(existing) == len(kinds):
+                    continue
             hst, hsc, hsc_hr, _ = dataset[i]
             if hst is None:
                 print(f"  skipped {name}: dataset returned no sample")
@@ -202,49 +237,70 @@ def main(argv=None) -> None:
             continue
         lr = torch.stack([b[2] for b in batch]).unsqueeze(1)
         cond = torch.stack([b[3] for b in batch]).unsqueeze(1).to(device)
-        pred = predict(lr, cond).detach().float().cpu().numpy()[:, 0]
-        for (name, hst, hsc, _, hr_header), p in zip(batch, pred, strict=True):
-            l1 = float(np.mean(np.abs(center_crop(p, HR_SIZE) - center_crop(hst.numpy(), HR_SIZE))))
-            header = cropped_wcs_header(split / "hr" / name, HR_SIZE)
-            header["BUNIT"] = "nJy"
+        draws = torch.stack([predict(lr, cond).detach().float().cpu() for _ in range(args.samples)])
+        images = stack.stack(draws) if args.samples > 1 else {None: draws[0]}
+        for j, (name, hst, hsc, _, hr_header) in enumerate(batch):
+            target = hst.numpy()
+            base = cropped_wcs_header(split / "hr" / name, HR_SIZE)
+            base["BUNIT"] = "nJy"
             njy = njy_per_px(hr_header)
-            header["HRNJYPX"] = (njy, "NJYPERPX of the HR cutout, applied to get nJy")
-            header.update(source)
-            header["PAIRID"] = pair_id(hr_header)
-            header["L1LOG"] = l1
-            sr = to_physical(p) * njy
-            fits.PrimaryHDU(sr.astype(np.float32), header=header).writeto(
-                out / name, overwrite=True
-            )
-            rows.append({"name": name, "l1_log": l1})
+            base["HRNJYPX"] = (njy, "NJYPERPX of the HR cutout, applied to get nJy")
+            base.update(source)
+            base["PAIRID"] = pair_id(hr_header)
+            for kind in kinds:
+                p = images[kind][j, 0].numpy()
+                header = base.copy()
+                header.update(stack_cards(kind))
+                if kind == "std":  # already linear, in the HR pairs' stored units
+                    sr = center_crop(p.astype(np.float64), HR_SIZE) * njy
+                else:
+                    l1 = stack.l1(p, target)
+                    header["L1LOG"] = l1
+                    rows[kind].append({"name": name, "l1_log": l1})
+                    sr = to_physical(p) * njy
+                fits.PrimaryHDU(sr.astype(np.float32), header=header).writeto(
+                    dirs[kind] / name, overwrite=True
+                )
+            n_done += 1
             if experiment is not None:
-                experiment.log_metric("l1_log", l1, step=len(rows))
-                if len(rows) <= N_EXAMPLES:
-                    fig = example_figure(name, hsc.numpy(), p, hst.numpy())
-                    experiment.log_figure(figure_name=f"example {len(rows)}: {name}", figure=fig)
+                experiment.log_metrics(
+                    {"l1_log" + (f"_{k}" if k else ""): rows[k][-1]["l1_log"] for k in scored},
+                    step=n_done,
+                )
+                if n_done <= N_EXAMPLES:
+                    if args.samples > 1:
+                        fig = stack.stack_figure(
+                            name,
+                            hsc.numpy(),
+                            target,
+                            {k: images[k][j, 0].numpy() for k in stack.KINDS},
+                            args.samples,
+                        )
+                    else:
+                        fig = example_figure(name, hsc.numpy(), images[None][j, 0].numpy(), target)
+                    experiment.log_figure(figure_name=f"example {n_done}: {name}", figure=fig)
                     plt.close(fig)
         done = min(start + args.batch_size, len(order))
         print(f"  {done}/{len(order)} ({(time.time() - t0) / done:.2f} s/pair)")
 
-    if rows:
-        path = out / "predictions.csv"
-        new = not path.exists()
-        with open(path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["name", "l1_log"])
-            if new:
-                writer.writeheader()
-            writer.writerows(rows)
-        mean_l1 = np.mean([r["l1_log"] for r in rows])
-        print(f"wrote {len(rows)} predictions; mean log-space L1 {mean_l1:.4f}")
+    if n_done:
+        summary = {"n_written": n_done, "s_per_pair": (time.time() - t0) / n_done}
+        for kind in scored:
+            path = dirs[kind] / "predictions.csv"
+            new = not path.exists()
+            with open(path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["name", "l1_log"])
+                if new:
+                    writer.writeheader()
+                writer.writerows(rows[kind])
+            mean_l1 = np.mean([r["l1_log"] for r in rows[kind]])
+            label = f" ({kind} of {args.samples} draws)" if kind else ""
+            print(f"wrote {n_done} predictions{label}; mean log-space L1 {mean_l1:.4f}")
+            summary["mean_l1_log" + (f"_{kind}" if kind else "")] = mean_l1
+            if experiment is not None:
+                experiment.log_table(str(path))
         if experiment is not None:
-            experiment.log_metrics(
-                {
-                    "mean_l1_log": mean_l1,
-                    "n_written": len(rows),
-                    "s_per_pair": (time.time() - t0) / len(rows),
-                }
-            )
-            experiment.log_table(str(path))
+            experiment.log_metrics(summary)
     if experiment is not None:
         experiment.end()
 
