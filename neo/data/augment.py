@@ -6,16 +6,18 @@ same whole number of LR pixels (6x as many HR pixels, so LR pixels stay nested i
 the 21 px of slack around the centre crop, giving 43 x 43 distinct training views per pair, all
 inside its stored footprint (which is what the train/val leakage check covers). ShiftD4Dataset
 also applies the same random 90-degree rotation and flip (the 8 lossless symmetries of the pixel
-grid), for 43 x 43 x 8 views; the paper had no rotations or flips. Everything after loading
-(clip, log scaling, segmentation map, crop, padding) is the dataset's unchanged code. Validation
-and evaluation keep the plain centre crop.
+grid), for 43 x 43 x 8 views; the paper had no rotations or flips. Rot90Dataset only rotates (by
+0, 90, 180 or 270 degrees; no shift, no flip): the centre crop in 4 orientations. Everything
+after loading (clip, log scaling, segmentation map, crop, padding) is the dataset's unchanged
+code. Validation and evaluation keep the plain centre crop.
 
 The paper's code passed hsc_hr (the discriminator's conditioning image) through ToPILImage()
 without a mode, which cast it to 8 bits; paper_8bit reproduces that on hsc_hr only, for both the
 training and the validation dataset (the paper used one dataset class for both).
 
-Config: [DATA_AUG] augment = none | shift | shift_d4 (default: none) picks the training class;
-[DATASET] hsc_hr_8bit = none | wrap | saturate (default: none) applies to training and validation.
+Config: [DATA_AUG] augment = none | shift | shift_d4 | rot90 (default: none) picks the training
+class; [DATASET] hsc_hr_8bit = none | wrap | saturate (default: none) applies to training and
+validation.
 """
 
 import os
@@ -105,6 +107,12 @@ class ShiftD4Dataset(ShiftDataset):
         )
 
 
+class Rot90Dataset(ShiftDataset):
+    def draw(self):
+        """No shift or flip; rotation by 0, 90, 180 or 270 degrees."""
+        return 0, 0, random.randrange(4), False
+
+
 class Paper8BitMixin:
     """Passes hsc_hr through paper_8bit(hsc_hr, self.hsc_hr_8bit); hst, hsc, segmap untouched."""
 
@@ -117,7 +125,12 @@ class Paper8BitMixin:
         return hst, hsc, paper_8bit(hsc_hr, self.hsc_hr_8bit), seg
 
 
-AUGMENTATIONS = {"none": SR_HST_HSC_Dataset, "shift": ShiftDataset, "shift_d4": ShiftD4Dataset}
+AUGMENTATIONS = {
+    "none": SR_HST_HSC_Dataset,
+    "shift": ShiftDataset,
+    "shift_d4": ShiftD4Dataset,
+    "rot90": Rot90Dataset,
+}
 
 
 def _with_8bit(base, mode):
