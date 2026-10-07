@@ -3,6 +3,8 @@
 Same data, preprocessing, validation logging and checkpointing as train.py; only the model and its
 objective differ. The dataset class is used unchanged (center crop -> clip -> ds9 log scale ->
 pad), and the model learns p(HR | 6x-upsampled LR) in that log space (see neo/diffusion.py).
+Optional [DIFFUSION] source-focus options (neo/diffusion.py SourceFocus) add weight on object
+pixels to the loss and centre part of the training crops on LR-detected sources.
 
 Usage:
     python train_diffusion.py <config_file> [--resume]
@@ -80,6 +82,33 @@ def measure_stats(dataloader, n_batches):
     }
 
 
+def mask_figure(hst, lr, lr_mask, hst_segmap=None):
+    """HST and LR images of one val cutout with the LR source mask (and the HST segmentation map
+    when the loss uses it), central 600 px / 100 LR px, arrays in the training log space."""
+    hst, lr_mask = (CenterCrop(600)(torch.as_tensor(a)).numpy() for a in (hst, lr_mask))
+    lr = CenterCrop(100)(torch.as_tensor(lr)).numpy()
+    panels = 3 if hst_segmap is None else 4
+    fig, axes = plt.subplots(1, panels, figsize=(5.5 * panels, 5.8), layout="constrained")
+    vmin, vmax = np.percentile(hst, [1, 99.8])
+    axes[0].imshow(hst, origin="lower", cmap="plasma", vmin=vmin, vmax=vmax)
+    axes[0].set_title("HST")
+    axes[1].imshow(lr, origin="lower", cmap="plasma", vmin=np.percentile(lr, 1), vmax=lr.max())
+    axes[1].set_title("LR")
+    # The LR mask outlined on the HST image; LR pixel edges sit at 6 px boundaries
+    axes[2].imshow(hst, origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
+    axes[2].contour(lr_mask, levels=[0.5], colors="cyan", linewidths=0.8)
+    axes[2].set_title(f"LR source mask ({lr_mask.mean():.1%} of pixels)")
+    if hst_segmap is not None:
+        segmap = CenterCrop(600)(torch.as_tensor(hst_segmap)).numpy()
+        axes[3].imshow(segmap, origin="lower", cmap="gray", vmin=0, vmax=1)
+        axes[3].contour(lr_mask, levels=[0.5], colors="cyan", linewidths=0.8)
+        axes[3].set_title(f"HST segmap ({segmap.mean():.1%}), LR mask outlined")
+    for ax in axes:
+        ax.set_xticks([])
+        ax.set_yticks([])
+    return fig
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train the diffusion SR model from an .ini config")
     parser.add_argument("config", help="training .ini file")
@@ -134,6 +163,8 @@ def main():
     sample_every = dcfg.getint("sample_every", 5000)
     stack_samples = dcfg.getint("stack_samples", 8)
     stats_batches = dcfg.getint("stats_batches", 50)
+    # Source focus (neo/diffusion.py SourceFocus): object-weighted loss, source-centred crops
+    focus = diffusion.SourceFocus.from_section(dcfg)
 
     # Comet ML experiment tracking; logs locally when no API key is set
     api_key = os.environ.get("COMET_ML_ASTRO_API_KEY")
@@ -156,7 +187,7 @@ def main():
         {f"diffusion_{k}": v for k, v in dcfg.items() if k not in config.defaults()}
     )
 
-    model_name = f"edm_{identifier}_lr={lr}_crop={crop_size}_ema={ema_decay}"
+    model_name = f"edm_{identifier}_lr={lr}_crop={crop_size}_ema={ema_decay}{focus.name()}"
     print(model_name)
 
     def make_loader(hst_path, hsc_path, dataset_class=SR_HST_HSC_Dataset):
@@ -218,46 +249,76 @@ def main():
     # Training loop
     model.train()
     while cur_step < total_steps:
-        for hr_real, _, hsc_hr, _ in tqdm(dataloader_train, position=0):
-            hr_crop, cond_crop = diffusion.random_crops(
-                hr_real.unsqueeze(1), hsc_hr.unsqueeze(1), crop_size
+        for hr_real, _, hsc_hr, hst_seg in tqdm(dataloader_train, position=0):
+            hr_real, hsc_hr = hr_real.unsqueeze(1), hsc_hr.unsqueeze(1)
+            # At the default options: no mask, uniform crops and the plain loss, with the same
+            # random draws as before these options existed
+            lr_mask = None
+            if focus.needs_lr_mask:
+                hsc_hr = hsc_hr.to(device)  # its crops are then taken on the device too
+                lr_mask = focus.lr_mask(hsc_hr)
+            object_mask = focus.weight_mask(lr_mask, hst_seg.unsqueeze(1))
+            offsets = diffusion.crop_offsets(
+                hr_real.shape[0], crop_size, lr_mask, focus.source_crop_frac
+            )
+            hr_crop, cond_crop, *mask_crop = diffusion.apply_crops(
+                offsets, crop_size, hr_real, hsc_hr, *([] if object_mask is None else [object_mask])
             )
             y = model.normalize(hr_crop.to(device))
             cond = model.normalize_cond(cond_crop.to(device))
+            mask = mask_crop[0].to(device) if mask_crop else None
 
             for group in opt.param_groups:
                 group["lr"] = lr * min(1.0, (cur_step + 1) / warmup_steps)
-            loss = diffusion.edm_loss(model, y, cond, p_mean, p_std)
+            loss, loss_all, loss_obj = diffusion.edm_loss(
+                model, y, cond, p_mean, p_std, mask, focus.object_weight, parts=True
+            )
             opt.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             opt.step()
             ema.update(model, cur_step)
 
-            experiment.log_metrics(
-                {
-                    "EDM Loss": loss.item(),
-                    "Grad Norm": grad_norm.item(),
-                },
-                step=cur_step,
-            )
+            metrics = {"EDM Loss": loss.item(), "Grad Norm": grad_norm.item()}
+            if mask is not None:
+                metrics["EDM Loss (all pixels)"] = loss_all.item()
+                metrics["EDM Loss (object pixels)"] = loss_obj.item()
+                metrics["Object Pixel Fraction"] = mask.mean().item()
+            experiment.log_metrics(metrics, step=cur_step)
 
             # Validation and logging
             if cur_step % display_step == 0 and cur_step > 0:
-                hr_real_val, lr_val, hsc_hr_val, _ = next_val_batch()
+                hr_real_val, lr_val, hsc_hr_val, seg_val = next_val_batch()
                 hr_real_val = hr_real_val.unsqueeze(1).to(device)
                 hsc_hr_val = hsc_hr_val.unsqueeze(1).to(device)
+                seg_val = seg_val.unsqueeze(1).to(device)
+                # "EDM Val Loss" stays the unweighted loss on uniform crops, comparable across runs;
+                # the object term is computed on the same crops and draws with the run's mask
+                lr_mask_val = focus.lr_mask(hsc_hr_val) if focus.enabled else None
+                val_mask = focus.weight_mask(lr_mask_val, seg_val)
                 with torch.no_grad():
-                    hr_crop, cond_crop = diffusion.random_crops(hr_real_val, hsc_hr_val, crop_size)
-                    val_loss = diffusion.edm_loss(
+                    offsets = diffusion.crop_offsets(hr_real_val.shape[0], crop_size)
+                    hr_crop, cond_crop, *val_mask_crop = diffusion.apply_crops(
+                        offsets,
+                        crop_size,
+                        hr_real_val,
+                        hsc_hr_val,
+                        *([] if val_mask is None else [val_mask]),
+                    )
+                    _, val_loss, val_loss_obj = diffusion.edm_loss(
                         ema.model,
                         ema.model.normalize(hr_crop),
                         ema.model.normalize_cond(cond_crop),
                         p_mean,
                         p_std,
-                    ).item()
+                        val_mask_crop[0] if val_mask_crop else None,
+                        parts=True,
+                    )
+                val_loss = val_loss.item()
                 print(f"Step: {cur_step}, EDM loss: {loss.item():.5f}, val loss: {val_loss:.5f}")
                 val_metrics = {"EDM Val Loss": val_loss}
+                if val_loss_obj is not None:
+                    val_metrics["EDM Val Loss (object pixels)"] = val_loss_obj.item()
 
                 # Full-cutout samples: slow (2*sample_steps-1 network calls), so less often
                 if cur_step % sample_every == 0:
@@ -320,6 +381,17 @@ def main():
                         experiment.log_figure(
                             figure_name="Single vs Stacked Samples", figure=fig, step=cur_step
                         )
+                        plt.close(fig)
+
+                    # The masks of the first val image, to check by eye that they sit on sources
+                    if focus.enabled:
+                        fig = mask_figure(
+                            hr_val.numpy(),
+                            lr_val_img.numpy(),
+                            lr_mask_val[0, 0].cpu().numpy(),
+                            seg_val[0, 0].cpu().numpy() if focus.object_mask == "hst" else None,
+                        )
+                        experiment.log_figure(figure_name="Source Masks", figure=fig, step=cur_step)
                         plt.close(fig)
 
                 experiment.log_metrics(val_metrics, step=cur_step)
