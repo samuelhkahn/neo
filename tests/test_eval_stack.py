@@ -144,3 +144,24 @@ def test_samples_refused_for_a_deterministic_generator(monkeypatch, tmp_path):
         monkeypatch, split, tmp_path / "pred", 2, "neo", "--gen-mode", "train", "--batch-size", "1"
     )
     assert fits.getheader(tmp_path / "pred" / "median" / NAME)["NEOGMODE"] == "train"
+
+
+def test_parse_sizes():
+    assert stack.parse_sizes("8") == [8]
+    assert stack.parse_sizes("32, 8,16") == [8, 16, 32]
+    assert stack.parse_sizes("0") == [] and stack.parse_sizes("1,8,8") == [8]
+
+
+def test_convergence_figure_columns_and_noise_shrinking():
+    rng = np.random.default_rng(1)
+    hr = rng.uniform(-1, 0, (768, 768))
+    draws = torch.from_numpy(hr + rng.normal(0, 0.05, (16, 768, 768)))
+    stacks = {k: {n: v.numpy() for n, v in stack.stack(draws[:k]).items()} for k in (4, 16)}
+    fig = stack.convergence_figure("x", hr, draws[0].numpy(), stacks)
+    titles = [ax.get_title() for ax in fig.axes if ax.get_title()]
+    assert len(titles) == 6 and titles[0].startswith("one draw - HST")
+    assert any(t.startswith("median of 16 - HST") for t in titles)
+    l1 = {t.split("   L1 ")[0]: float(t.split("   L1 ")[1]) for t in titles}
+    # independent draw noise: the stacks' residual shrinks about as 1/sqrt(k)
+    assert l1["mean of 16 - HST"] < 0.6 * l1["mean of 4 - HST"] < 0.6 * l1["one draw - HST"]
+    matplotlib.pyplot.close(fig)
