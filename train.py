@@ -22,6 +22,7 @@ from comet_ml import Experiment, OfflineExperiment
 from torchvision.transforms import CenterCrop
 from tqdm import tqdm
 
+from neo import checkpoint
 from neo.data.augment import dataset_classes, hsc_hr_8bit_mode
 from neo.data.collate_fn import collate_fn
 from neo.log_figure import log_figure
@@ -29,7 +30,7 @@ from neo.pix2pix import Pix2Pix
 
 
 def save_checkpoint(path, pix2pix, step, model_name):
-    """Write model + optimizer state atomically, so a killed job never leaves a corrupt file."""
+    """Write model + optimizer state crash-safely (neo/checkpoint.py): never a truncated file."""
     state = {
         "step": step,
         "model_name": model_name,
@@ -38,13 +39,10 @@ def save_checkpoint(path, pix2pix, step, model_name):
         "gen_opt": pix2pix.gen_opt.state_dict(),
         "disc_opt": pix2pix.disc_opt.state_dict(),
     }
-    tmp = path.with_name(path.name + ".tmp")
-    torch.save(state, tmp)
-    os.replace(tmp, path)
+    checkpoint.save(state, path)
 
 
-def load_checkpoint(path, pix2pix, device):
-    state = torch.load(path, map_location=device, weights_only=True)
+def load_checkpoint(state, pix2pix):
     pix2pix.gen.load_state_dict(state["gen"])
     pix2pix.patch_gan.load_state_dict(state["patch_gan"])
     pix2pix.gen_opt.load_state_dict(state["gen_opt"])
@@ -56,7 +54,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train NEO from an .ini config")
     parser.add_argument("config", help="training .ini file")
     parser.add_argument("--resume", action="store_true",
-                        help="continue from <ckpt_dir>/latest.pt if it exists")
+                        help="continue from the newest readable checkpoint in <ckpt_dir> (latest.pt, "
+                             "else the newest step_*.pt)")
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -199,9 +198,11 @@ def main():
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     cur_step = 0
     latest = ckpt_dir / "latest.pt"
-    if args.resume and latest.exists():
-        cur_step = load_checkpoint(latest, pix2pix, device)
-        print(f"resumed from {latest} at step {cur_step}")
+    if args.resume:
+        path, state = checkpoint.load_latest(ckpt_dir, device)
+        if state is not None:
+            cur_step = load_checkpoint(state, pix2pix)
+            print(f"resumed from {path} at step {cur_step}")
     experiment.log_parameter("start_step", cur_step)
 
     # Training loop
