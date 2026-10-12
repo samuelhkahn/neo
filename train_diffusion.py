@@ -25,7 +25,7 @@ from comet_ml import Experiment, OfflineExperiment
 from torchvision.transforms import CenterCrop
 from tqdm import tqdm
 
-from neo import diffusion
+from neo import checkpoint, diffusion
 from neo.data.augment import dataset_classes
 from neo.data.collate_fn import collate_fn
 from neo.data.dataset import SR_HST_HSC_Dataset
@@ -34,7 +34,7 @@ from neo.log_figure import log_figure
 
 
 def save_checkpoint(path, model, ema, opt, step, model_name):
-    """Write model + EMA + optimizer state atomically; a killed job never leaves a corrupt file."""
+    """Write model + EMA + optimizer state crash-safely (neo/checkpoint.py)."""
     state = {
         "step": step,
         "model_name": model_name,
@@ -42,13 +42,10 @@ def save_checkpoint(path, model, ema, opt, step, model_name):
         "ema": ema.model.state_dict(),
         "opt": opt.state_dict(),
     }
-    tmp = path.with_name(path.name + ".tmp")
-    torch.save(state, tmp)
-    os.replace(tmp, path)
+    checkpoint.save(state, path)
 
 
-def load_checkpoint(path, model, ema, opt, device):
-    state = torch.load(path, map_location=device, weights_only=True)
+def load_checkpoint(state, model, ema, opt):
     model.load_state_dict(state["model"])
     ema.model.load_state_dict(state["ema"])
     opt.load_state_dict(state["opt"])
@@ -113,7 +110,10 @@ def main():
     parser = argparse.ArgumentParser(description="Train the diffusion SR model from an .ini config")
     parser.add_argument("config", help="training .ini file")
     parser.add_argument(
-        "--resume", action="store_true", help="continue from <ckpt_dir>/latest.pt if it exists"
+        "--resume",
+        action="store_true",
+        help="continue from the newest readable checkpoint in <ckpt_dir> (latest.pt, else the "
+        "newest step_*.pt)",
     )
     args = parser.parse_args()
 
@@ -236,9 +236,10 @@ def main():
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     cur_step = 0
     latest = ckpt_dir / "latest.pt"
-    if args.resume and latest.exists():
-        cur_step = load_checkpoint(latest, model, ema, opt, device)
-        print(f"resumed from {latest} at step {cur_step}")
+    path, state = checkpoint.load_latest(ckpt_dir, device) if args.resume else (None, None)
+    if state is not None:
+        cur_step = load_checkpoint(state, model, ema, opt)
+        print(f"resumed from {path} at step {cur_step}")
     else:
         stats = measure_stats(dataloader_train, stats_batches)
         model.set_stats(**stats)
