@@ -13,6 +13,9 @@ find "$NEO_DATA/tmp" -mindepth 1 -maxdepth 1 -type d -mtime +2 -exec rm -rf {} +
 export TMPDIR="$NEO_DATA/tmp/${SLURM_JOB_NAME:-job}-${SLURM_JOB_ID:-$$}"
 mkdir -p "$TMPDIR"
 export COMET_FALLBACK_STREAMER_FALLBACK_TO_OFFLINE_MIN_BACKEND_VERSION=999.0.0
+# DataLoader workers pass batches through /dev/shm; a full one kills them with a bus error (the
+# diffusion pair job at step 600k, 2026-10-10), so record how much the node has
+df -h /dev/shm 2>/dev/null | tail -n 1 | sed 's/^/shm: /' || true
 (
   while sleep "${JOB_TMP_SWEEP_SECONDS:-300}"; do
     find "$TMPDIR" -maxdepth 1 -type f \( -name 'tmp*.svg' -o -name 'tmp*.png' \) \
