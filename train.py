@@ -94,6 +94,9 @@ def main():
     data_aug = eval(config["DATA_AUG"]["data_aug"])
     identifier = eval(config["IDENTIFIER"]["identifier"])
     display_step = eval(config["DISPLAY_STEPS"]["display_steps"])
+    # Figures (6 per logging step) only every figure_steps steps: Comet accepts at most 100,000
+    # images per experiment, which display_steps = 25 reaches at ~417k steps. Default: display_steps.
+    figure_step = config.getint("DISPLAY_STEPS", "figure_steps", fallback=display_step)
 
     # Optimizer parameters
     lr = eval(config["LR"]["lr"])
@@ -128,6 +131,7 @@ def main():
     experiment.log_parameter("save_steps", save_steps)
     experiment.log_parameter("data_aug", data_aug)
     experiment.log_parameter("display_step", display_step)
+    experiment.log_parameter("figure_step", figure_step)
     experiment.log_parameter("lr", lr)
     experiment.log_parameter("disc_lr", disc_lr)
     experiment.log_parameter("lambda_recon", lambda_recon)
@@ -276,12 +280,13 @@ def main():
                 img_diff = CenterCrop(600)(fake_val - hr_val).cpu().detach().numpy()
                 vmax = np.abs(img_diff).max()
 
-                log_figure(CenterCrop(100)(lr_val_img).detach().numpy(), "100x100 Conditioned Val Image (LR)", experiment, step=cur_step)
-                log_figure(CenterCrop(600)(fake_val).detach().numpy(), "600x600 Generated Val Image (SR)", experiment, step=cur_step)
-                log_figure(CenterCrop(600)(hr_val).detach().numpy(), "600x600 Real Val Image (HST)", experiment, step=cur_step)
-                log_figure(real_disc_val_map.detach().numpy(), "Real Disc Val Logits", experiment, step=cur_step)
-                log_figure(fake_disc_val_map.detach().numpy(), "Fake Disc Val Logits", experiment, step=cur_step)
-                log_figure(img_diff, "Paired Image Difference", experiment, cmap="bwr_r", set_lims=True, lims=[-vmax, vmax], step=cur_step)
+                if cur_step % figure_step == 0:
+                    log_figure(CenterCrop(100)(lr_val_img).detach().numpy(), "100x100 Conditioned Val Image (LR)", experiment, step=cur_step)
+                    log_figure(CenterCrop(600)(fake_val).detach().numpy(), "600x600 Generated Val Image (SR)", experiment, step=cur_step)
+                    log_figure(CenterCrop(600)(hr_val).detach().numpy(), "600x600 Real Val Image (HST)", experiment, step=cur_step)
+                    log_figure(real_disc_val_map.detach().numpy(), "Real Disc Val Logits", experiment, step=cur_step)
+                    log_figure(fake_disc_val_map.detach().numpy(), "Fake Disc Val Logits", experiment, step=cur_step)
+                    log_figure(img_diff, "Paired Image Difference", experiment, cmap="bwr_r", set_lims=True, lims=[-vmax, vmax], step=cur_step)
 
                 experiment.log_metrics({
                     "Generator Val Loss": gen_val_loss,
