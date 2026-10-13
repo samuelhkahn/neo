@@ -49,7 +49,7 @@ from neo.eval.postprocess import HR_SIZE, center_crop, njy_per_px, to_physical  
 from neo.eval.predict import pick_device  # noqa: E402
 from neo.eval.tracking import start_experiment  # noqa: E402
 from neo.models.patchgan import PatchGAN  # noqa: E402
-from neo.models.registry import make_generator  # noqa: E402
+from neo.models.registry import check_generator, make_generator  # noqa: E402
 from neo.models.vgg19_loss import VGGLoss  # noqa: E402
 
 STEP_FILE = re.compile(r"^step_(\d+)\.pt$")
@@ -67,11 +67,16 @@ def step_files(ckpt_dir: Path) -> dict:
     return dict(sorted(found.items()))
 
 
-def load_state(path: Path) -> dict:
-    return torch.load(path, map_location="cpu", weights_only=True)
+def load_state(path: Path, config=None) -> dict:
+    """One checkpoint; with config, refused unless written by the generator the config builds
+    (neo and neo_relu share their keys, so load_state_dict alone would take either)."""
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    if config is not None:
+        check_generator(state, config, path)
+    return state
 
 
-def average_states(paths) -> dict:
+def average_states(paths, config=None) -> dict:
     """Uniform average of the generator and discriminator weights of several checkpoints.
 
     Floating-point tensors are averaged; integer buffers (BatchNorm's num_batches_tracked) are
@@ -80,7 +85,7 @@ def average_states(paths) -> dict:
     """
     total = {}
     for i, path in enumerate(paths):
-        state = load_state(path)
+        state = load_state(path, config)  # each file is checked: the average keeps no record
         for part in ("gen", "patch_gan"):
             dest = total.setdefault(part, {})
             for key, value in state[part].items():
@@ -307,7 +312,7 @@ def main(argv=None):
     fine_all = json.loads(fine_out.read_text()) if fine_out.exists() else {}
     for label, step, paths in jobs:
         t0 = time.time()
-        state = average_states(paths) if len(paths) > 1 else load_state(paths[0])
+        state = average_states(paths, config) if len(paths) > 1 else load_state(paths[0], config)
         gen.load_state_dict(state["gen"])
         disc.load_state_dict(state["patch_gan"])
         rows, fine = evaluate(
