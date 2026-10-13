@@ -85,7 +85,8 @@ def main():
     hsc_dim = int(config["HSC_DIM"]["hsc_dim"])
 
     # Training parameters
-    comet_tag = config["COMET_TAG"]["comet_tag"]
+    # The .ini quotes the tag; without stripping, Comet shows the quotes as part of it
+    comet_tag = config["COMET_TAG"]["comet_tag"].strip().strip('"')
     comet_project = config.get("COMET_PROJECT", "comet_project", fallback="neo-rubin-lsst")
     batch_size = int(config["BATCH_SIZE"]["batch_size"])
     total_steps = int(config["GAN_STEPS"]["gan_steps"])
@@ -128,6 +129,10 @@ def main():
         experiment = OfflineExperiment(offline_directory="comet_offline", **comet_kwargs)
 
     experiment.add_tag(comet_tag)
+    # Short tags and a readable name, so runs can be filtered and told apart in Comet's tables
+    augment_name = config.get("DATA_AUG", "augment", fallback="none")
+    experiment.add_tags([identifier, generator_name(config), f"augment {augment_name}"])
+    experiment.set_name(identifier)
     experiment.log_parameter("batch_size", batch_size)
     experiment.log_parameter("total_steps", total_steps)
     experiment.log_parameter("save_steps", save_steps)
