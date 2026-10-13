@@ -26,6 +26,7 @@ from neo import checkpoint
 from neo.data.augment import dataset_classes, hsc_hr_8bit_mode
 from neo.data.collate_fn import collate_fn
 from neo.log_figure import log_figure
+from neo.models.registry import generator_name, make_generator
 from neo.pix2pix import Pix2Pix
 
 
@@ -34,6 +35,9 @@ def save_checkpoint(path, pix2pix, step, model_name):
     state = {
         "step": step,
         "model_name": model_name,
+        # the [MODEL] generator (set by main): neo and neo_relu checkpoints have the same keys, so
+        # only this tells them apart (neo/models/registry.py check_generator)
+        "generator": pix2pix.generator_name,
         "gen": pix2pix.gen.state_dict(),
         "patch_gan": pix2pix.patch_gan.state_dict(),
         "gen_opt": pix2pix.gen_opt.state_dict(),
@@ -184,7 +188,9 @@ def main():
             val_iter = iter(dataloader_val)
             return next(val_iter)
 
-    # Initialize model
+    # Initialize model; [MODEL] generator swaps in a different generator (default: the NEO U-Net)
+    gen_name = generator_name(config)
+    experiment.log_parameter("generator", gen_name)
     pix2pix = Pix2Pix(
         in_channels=1, out_channels=1, device=device,
         learning_rate=lr, disc_learning_rate=disc_lr,
@@ -193,9 +199,14 @@ def main():
         lambda_adv=lambda_adv,
         display_step=display_step, pretrained_generator=pretrained_generator,
         pretrained_discriminator=pretrained_discriminator,
+        generator=None if gen_name == "neo" else make_generator(config),
     )
+    n_params = sum(p.numel() for p in pix2pix.gen.parameters())
+    print(f"generator: {gen_name} ({n_params / 1e6:.1f} M parameters)")
+    experiment.log_parameter("generator_params", n_params)
 
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    pix2pix.generator_name = gen_name  # recorded in every checkpoint (save_checkpoint)
     cur_step = 0
     latest = ckpt_dir / "latest.pt"
     if args.resume:
@@ -204,6 +215,12 @@ def main():
             cur_step = load_checkpoint(state, pix2pix)
             print(f"resumed from {path} at step {cur_step}")
     experiment.log_parameter("start_step", cur_step)
+    if args.resume and state is not None:
+        # neo and neo_relu checkpoints have the same keys, so the strict load above accepts either:
+        # stop before the first step if this one was written by another generator
+        from neo.models.registry import check_generator
+
+        check_generator(state, config, path)
 
     # Training loop
     while cur_step < total_steps:
@@ -248,7 +265,14 @@ def main():
                 lr_val = lr_val.unsqueeze(1).to(device)
                 seg_map_real_val = seg_map_real_val.unsqueeze(1).to(device)
 
+                # Generators that can measure their decoder ReLUs (neo/models/generator_variants.py)
+                # do so in this pass only, so training steps pay nothing
+                records_activations = hasattr(pix2pix.gen, "activation_stats")
+                if records_activations:
+                    pix2pix.gen.record_activations = True
                 val_losses = pix2pix.validation_step(hr_real_val, lr_val, hsc_hr_val, seg_map_real_val, "generator")
+                if records_activations:
+                    pix2pix.gen.record_activations = False
                 gen_val_loss = val_losses[0].item()
                 adv_val_loss = val_losses[1].item()
                 recon_val_loss = val_losses[2].item()
@@ -291,6 +315,12 @@ def main():
                     "L1 Val Segmap/L1 Recon Ratio": segmap_val_loss / recon_val_loss,
                     "Adversarial Val Loss": adv_val_loss,
                 }, step=cur_step)
+                if records_activations:
+                    # per block, the fraction of its batch-norm output <= 0, measured before dropout
+                    experiment.log_metrics({
+                        f"Decoder ReLU zero fraction/{name}": fraction
+                        for name, fraction in pix2pix.gen.activation_stats().items()
+                    }, step=cur_step)
 
             cur_step += 1
             # cur_step now counts completed steps, so a resumed run continues exactly here

@@ -63,22 +63,22 @@ class Vgg19(nn.Module):
         """Duplicate single-channel grayscale to 3-channel RGB for VGG input."""
         return torch.repeat_interleave(tensor, 3, dim=1)
 
-    def forward(self, X):
+    def forward(self, X, n_slices=5):
         """Extract multi-scale VGG features.
 
         Args:
             X: Input tensor of shape (B, 1, H, W) with values in [-1, 1].
+            n_slices: How many blocks to run (1-5); later blocks are not computed at all.
 
         Returns:
-            List of 5 feature tensors from successive VGG blocks.
+            List of the first n_slices feature tensors from successive VGG blocks.
         """
         X = self._tensor_zero_one_transform(X)
         X = self._duplicate_channels(X)
         X = self.normalize(X)
 
-        h_relu1 = self.slice1(X)
-        h_relu2 = self.slice2(h_relu1)
-        h_relu3 = self.slice3(h_relu2)
-        h_relu4 = self.slice4(h_relu3)
-        h_relu5 = self.slice5(h_relu4)
-        return [h_relu1, h_relu2, h_relu3, h_relu4, h_relu5]
+        features = []
+        for block in (self.slice1, self.slice2, self.slice3, self.slice4, self.slice5)[:n_slices]:
+            X = block(X)
+            features.append(X)
+        return features

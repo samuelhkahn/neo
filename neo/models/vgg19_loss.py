@@ -32,7 +32,10 @@ class VGGLoss(nn.Module):
         Returns:
             Weighted sum of MSE losses across VGG feature layers.
         """
-        x_vgg, y_vgg = self.vgg(x), self.vgg(y)
+        # Blocks after the last nonzero weight would only add 0 * loss (and zero gradients): skip
+        # them. lux.ini's weights [0, 1, 1, 0, 0] need blocks 1-3 of 5. A missing weight is a 0.
+        n_slices = max((i + 1 for i, w in enumerate(self.weights[:5]) if w != 0), default=1)
+        x_vgg, y_vgg = self.vgg(x, n_slices), self.vgg(y, n_slices)
         loss = 0
         for i in range(len(x_vgg)):
             loss += self.weights[i] * self.criterion(x_vgg[i], y_vgg[i].detach())

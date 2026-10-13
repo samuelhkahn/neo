@@ -9,12 +9,13 @@ GAN generators use only `lr`; conditional samplers (e.g. diffusion) use `cond`.
 
 import torch
 
-from neo.models.registry import generator_name, make_generator
+from neo.models.registry import check_generator, generator_name, make_generator
 
 
 def gan_predictor(config, checkpoint, device, mode: str = "eval"):
     gen = make_generator(config)
     state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    check_generator(state, config, checkpoint)  # neo / neo_relu weights would load either way
     gen.load_state_dict(state["gen"])
     gen.to(device)
     gen.train(mode == "train")
