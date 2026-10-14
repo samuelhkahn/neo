@@ -301,14 +301,22 @@ def main():
 
                 # Log visualization figures
                 img_diff = CenterCrop(600)(fake_val - hr_val).cpu().detach().numpy()
-                vmax = np.abs(img_diff).max()
+                # Symmetric difference scale from the 99.5th percentile, not the single worst pixel
+                vmax = np.percentile(np.abs(img_diff), 99.5)
 
                 if cur_step % figure_step == 0:
+                    # SR and HST share HST's colour scale, and the two logit maps share one symmetric
+                    # scale, so panels (and steps) can be compared by eye; LR keeps its own scale
+                    hst_img = CenterCrop(600)(hr_val).detach().numpy()
+                    sr_img = CenterCrop(600)(fake_val).detach().numpy()
+                    hst_lims = list(np.percentile(hst_img, [1, 99.8]))
+                    real_map, fake_map = real_disc_val_map.detach().numpy(), fake_disc_val_map.detach().numpy()
+                    logit_max = max(np.abs(real_map).max(), np.abs(fake_map).max(), 1e-6)
                     log_figure(CenterCrop(100)(lr_val_img).detach().numpy(), "100x100 Conditioned Val Image (LR)", experiment, step=cur_step)
-                    log_figure(CenterCrop(600)(fake_val).detach().numpy(), "600x600 Generated Val Image (SR)", experiment, step=cur_step)
-                    log_figure(CenterCrop(600)(hr_val).detach().numpy(), "600x600 Real Val Image (HST)", experiment, step=cur_step)
-                    log_figure(real_disc_val_map.detach().numpy(), "Real Disc Val Logits", experiment, step=cur_step)
-                    log_figure(fake_disc_val_map.detach().numpy(), "Fake Disc Val Logits", experiment, step=cur_step)
+                    log_figure(sr_img, "600x600 Generated Val Image (SR)", experiment, set_lims=True, lims=hst_lims, step=cur_step)
+                    log_figure(hst_img, "600x600 Real Val Image (HST)", experiment, set_lims=True, lims=hst_lims, step=cur_step)
+                    log_figure(real_map, "Real Disc Val Logits", experiment, cmap="coolwarm", set_lims=True, lims=[-logit_max, logit_max], step=cur_step)
+                    log_figure(fake_map, "Fake Disc Val Logits", experiment, cmap="coolwarm", set_lims=True, lims=[-logit_max, logit_max], step=cur_step)
                     log_figure(img_diff, "Paired Image Difference", experiment, cmap="bwr_r", set_lims=True, lims=[-vmax, vmax], step=cur_step)
 
                 experiment.log_metrics({
