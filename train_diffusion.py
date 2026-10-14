@@ -333,7 +333,12 @@ def main():
                     lr_val_img = lr_val[0].cpu()
                     fake_val = fake_val_images[0, 0].cpu().double()
                     img_diff = CenterCrop(600)(fake_val - hr_val).numpy()
-                    vmax = np.abs(img_diff).max()
+                    # Symmetric difference scale from the 99.5th percentile, not the worst pixel
+                    vmax = np.percentile(np.abs(img_diff), 99.5)
+                    # SR and HST share HST's colour scale so the panels compare by eye; LR keeps
+                    # its own (its sky noise is far larger in these units)
+                    hst_img = CenterCrop(600)(hr_val).numpy()
+                    hst_lims = list(np.percentile(hst_img, [1, 99.8]))
 
                     log_figure(
                         CenterCrop(100)(lr_val_img).numpy(),
@@ -345,12 +350,16 @@ def main():
                         CenterCrop(600)(fake_val).numpy(),
                         "600x600 Generated Val Image (SR)",
                         experiment,
+                        set_lims=True,
+                        lims=hst_lims,
                         step=cur_step,
                     )
                     log_figure(
-                        CenterCrop(600)(hr_val).numpy(),
+                        hst_img,
                         "600x600 Real Val Image (HST)",
                         experiment,
+                        set_lims=True,
+                        lims=hst_lims,
                         step=cur_step,
                     )
                     log_figure(
