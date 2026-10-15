@@ -16,6 +16,11 @@ rho fall. Summaries: k50, where T drops to 0.5 (1 / k50 is an effective resoluti
 band means of T, rho and R over FINE_BAND, between the LR and HST resolutions, using only the bins
 where HST's signal power exceeds twice its noise.
 
+A source whose SR stamp holds a pixel above `saturation` (sweep.py passes the flux of the
+generator's tanh ceiling, so this means "the generator saturated here") is left out of the sums
+and counted instead: in linear flux one saturated pixel outweighs every real source, and the count
+of such sources is the bright-blow-up rate, which the sweep reports as saturated_fraction.
+
 Ported from the 2026-10-12 fine-structure analysis (neo_outputs/scratch/curves_fine_structure).
 HST measurements depend only on the HST cutout, so HstSources computes them once and every SR image
 (e.g. every checkpoint of a run) reuses them.
@@ -122,15 +127,21 @@ class Accumulator:
         self.p_hst = np.zeros(spectra.nbins)
         self.p_noise = np.zeros(spectra.nbins)
         self.n_sources = 0
+        self.n_saturated = 0
 
-    def add(self, hst: HstSources, sr):
-        """Add one SR cutout (same grid and units as the HST cutout behind hst)."""
+    def add(self, hst: HstSources, sr, saturation=np.inf):
+        """Add one SR cutout (same grid and units as the HST cutout behind hst); sources whose SR
+        stamp reaches `saturation` are counted in n_saturated and skipped."""
         if not hst.positions:
             return
         sr = np.asarray(sr, dtype=np.float64)
-        sr = sr - np.median(sr[~hst.mask]) if (~hst.mask).any() else sr
+        sky = np.median(sr[~hst.mask]) if (~hst.mask).any() else 0.0
         for (x, y), flux, fh in zip(hst.positions, hst.fluxes, hst.ffts, strict=True):
-            fs = self.s.fft(_stamp(sr, x, y)) / flux
+            stamp = _stamp(sr, x, y)
+            if stamp.max() >= saturation:
+                self.n_saturated += 1
+                continue
+            fs = self.s.fft(stamp - sky) / flux
             fh = fh / flux
             self.cross += self.s.bin((fs * np.conj(fh)).real)
             self.p_sr += self.s.bin(np.abs(fs) ** 2)
@@ -166,6 +177,8 @@ class Accumulator:
             "rho_band": band_mean(rho),
             "R_band": band_mean(ratio),
             "n_sources": self.n_sources,
+            "n_saturated": self.n_saturated,
+            "saturated_fraction": self.n_saturated / max(self.n_sources + self.n_saturated, 1),
             "k": k.tolist(),
             "T": transfer.tolist(),
             "rho": rho.tolist(),

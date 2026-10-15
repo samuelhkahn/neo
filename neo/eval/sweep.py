@@ -54,7 +54,8 @@ from neo.models.vgg19_loss import VGGLoss  # noqa: E402
 
 STEP_FILE = re.compile(r"^step_(\d+)\.pt$")
 LOSSES = ("l1", "segmap_l1", "vgg", "adversarial", "discriminator")
-FINE = ("k50", "T_band", "rho_band", "R_band")
+FINE = ("k50", "T_band", "rho_band", "R_band", "saturated_fraction")
+SATURATION_LOG = 0.99  # a pixel this close to the generator's tanh ceiling of 1 is saturated
 
 
 def step_files(ckpt_dir: Path) -> dict:
@@ -171,7 +172,8 @@ def evaluate(gen, disc, vgg, images, hst_sources, spectra, device, seed=0, mode=
             }
         )
         sr_njy = to_physical(fake[0, 0].float().cpu().numpy()) * im["njy"]
-        acc.add(hst_sources[i], sr_njy)
+        saturation = float(to_physical(np.full((1, 768, 768), SATURATION_LOG))[0, 0, 0]) * im["njy"]
+        acc.add(hst_sources[i], sr_njy, saturation)
     return rows, acc.result()
 
 
@@ -184,6 +186,7 @@ def summarize(label, step, rows, fine):
         out[f"{key}_se"] = float(v.std(ddof=1) / np.sqrt(v.size)) if v.size > 1 else np.nan
     out.update({key: fine[key] for key in FINE})
     out["fine_n_sources"] = fine["n_sources"]
+    out["fine_n_saturated"] = fine["n_saturated"]
     return out
 
 
@@ -206,7 +209,7 @@ def append_rows(path: Path, rows: list) -> None:
 def sweep_figure(rows, title):
     """Each metric against step: numbered checkpoints as a line with standard errors, averages as
     stars at the end of their step range."""
-    panels = [*LOSSES, "k50", "T_band", "R_band"]
+    panels = [*LOSSES, "k50", "T_band", "saturated_fraction"]
     fig, axes = plt.subplots(2, 4, figsize=(19, 8.5), layout="constrained")
     plain = [r for r in rows if r["checkpoint"].startswith("step_")]
     averaged = [r for r in rows if r["checkpoint"].startswith("avg_")]
