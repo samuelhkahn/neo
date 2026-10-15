@@ -18,9 +18,10 @@
 #   CONFIG=neo/configs/lux_rot90.ini AVERAGES="550000:650000" sbatch scripts/lux/sweep.sbatch
 # Knobs: CONFIG (default lux.ini), AVERAGES (A:B ranges whose step files are averaged and scored
 # too), EVERY (only steps divisible by it), LIMIT (first N val images), MODE (train, the paper's
-# deployment mode with dropout on and per-image batch norm, or eval: deterministic). Output goes
-# to $NEO_DATA/sweeps/<config name>[-eval]/ (sweep.csv, per_image.csv, fine_structure.json,
-# sweep.png); a rerun scores only checkpoints saved since the last one.
+# deployment mode with dropout on and per-image batch norm, or eval: deterministic), TAG (a suffix
+# for the output directory, to rescore everything after a metric change). Output goes to
+# $NEO_DATA/sweeps/<config name>[-eval][-TAG]/ (sweep.csv, per_image.csv, fine_structure.json,
+# sweep.png); a rerun into the same directory scores only checkpoints saved since the last one.
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 export PATH="$HOME/.local/bin:$PATH"
@@ -32,6 +33,7 @@ CONFIG="${CONFIG:-neo/configs/lux.ini}"
 MODE="${MODE:-train}"
 OUT="$NEO_DATA/sweeps/$(basename "$CONFIG" .ini)"
 if [ "$MODE" = eval ]; then OUT="$OUT-eval"; fi
+if [ -n "${TAG:-}" ]; then OUT="$OUT-$TAG"; fi
 EXTRA=(--mode "$MODE")
 for range in ${AVERAGES:-}; do
   EXTRA+=(--average "$range")
