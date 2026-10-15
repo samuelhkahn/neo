@@ -394,3 +394,36 @@ def test_sweep_scores_and_averages_relu_arm_checkpoints(monkeypatch, tmp_path):
         "step_00050000",
         "avg_25000-50000",
     ]
+
+
+@pytest.mark.parametrize(
+    "arm, knob",
+    [
+        ("neo_relu_d4", ("DATA_AUG", "augment", "shift_d4")),
+        ("neo_relu_cleand", ("DATASET", "hsc_hr_8bit", "none")),
+    ],
+)
+def test_screening_configs_differ_from_arm_a_only_in_their_knob_and_length(arm, knob):
+    """Each screening arm is Arm A plus one change, trained for 300k steps."""
+    base = read_config(CONFIGS / "lux_neo_relu.ini")
+    cfg = read_config(CONFIGS / f"lux_{arm}.ini")
+    identifier = f"lux_cosmosweb_i_{arm}"
+    assert cfg["IDENTIFIER"]["identifier"] == f'"{identifier}"'
+    assert cfg["CHECKPOINT"]["ckpt_dir"] == "${NEO_DATA}/checkpoints/" + identifier
+    assert cfg["COMET_TAG"]["comet_tag"].strip('"').endswith(f" {arm}")
+    assert cfg["MODEL"]["generator"] == "neo_relu" and cfg["GAN_STEPS"]["gan_steps"] == "300000"
+    section, key, value = knob
+    assert cfg[section][key] == value
+    differ = {
+        (s, k)
+        for s in base.keys() | cfg.keys()
+        for k in base.get(s, {}).keys() | cfg.get(s, {}).keys()
+        if base.get(s, {}).get(k) != cfg.get(s, {}).get(k)
+    }
+    assert differ == {
+        ("IDENTIFIER", "identifier"),
+        ("CHECKPOINT", "ckpt_dir"),
+        ("COMET_TAG", "comet_tag"),
+        ("GAN_STEPS", "gan_steps"),
+        (section, key),
+    }
