@@ -401,6 +401,7 @@ def test_sweep_scores_and_averages_relu_arm_checkpoints(monkeypatch, tmp_path):
     [
         ("neo_relu_d4", ("DATA_AUG", {"augment": "shift_d4"})),
         ("neo_relu_cleand", ("DATASET", {"hsc_hr_8bit": "none"})),
+        ("neo_relu_noadv", ("LAMBDA_ADV", {"lambda_adv": "0"})),
         # the code arms: a new section, absent from Arm A (neo/consistency.py, neo/noise.py)
         (
             "neo_relu_flux",
