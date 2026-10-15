@@ -460,3 +460,23 @@ def test_screening_configs_differ_from_arm_a_only_in_their_knob_and_length(arm, 
         assert "CONFIG_A=neo/configs/lux_neo_relu_flux.ini" in header
         assert "CONFIG_B=neo/configs/lux_neo_relu_noise.ini" in header
         assert "sbatch scripts/lux/train_pair.sbatch" in header
+
+
+def test_second_seed_config_is_arm_a_with_only_names_and_length_changed():
+    base = read_config(CONFIGS / "lux_neo_relu.ini")
+    cfg = read_config(CONFIGS / "lux_neo_relu_seed2.ini")
+    assert cfg["IDENTIFIER"]["identifier"] == '"lux_cosmosweb_i_neo_relu_seed2"'
+    assert cfg["CHECKPOINT"]["ckpt_dir"] == "${NEO_DATA}/checkpoints/lux_cosmosweb_i_neo_relu_seed2"
+    assert cfg["GAN_STEPS"]["gan_steps"] == "300000"
+    differ = {
+        (s, k)
+        for s in base.keys() | cfg.keys()
+        for k in base.get(s, {}).keys() | cfg.get(s, {}).keys()
+        if base.get(s, {}).get(k) != cfg.get(s, {}).get(k)
+    }
+    assert differ == {
+        ("IDENTIFIER", "identifier"),
+        ("CHECKPOINT", "ckpt_dir"),
+        ("COMET_TAG", "comet_tag"),
+        ("GAN_STEPS", "gan_steps"),
+    }
