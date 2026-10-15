@@ -13,6 +13,7 @@ Example:
 
 import argparse
 import configparser
+import math
 import os
 from pathlib import Path
 
@@ -23,10 +24,12 @@ from torchvision.transforms import CenterCrop
 from tqdm import tqdm
 
 from neo import checkpoint
+from neo.consistency import ConsistencyLoss
 from neo.data.augment import dataset_classes, hsc_hr_8bit_mode
 from neo.data.collate_fn import collate_fn
 from neo.log_figure import log_figure
 from neo.models.registry import generator_name, make_generator
+from neo.noise import NoiseModel
 from neo.pix2pix import Pix2Pix
 
 
@@ -52,6 +55,16 @@ def load_checkpoint(state, pix2pix):
     pix2pix.gen_opt.load_state_dict(state["gen_opt"])
     pix2pix.disc_opt.load_state_dict(state["disc_opt"])
     return state["step"]
+
+
+def extra_metrics(extras, val):
+    """Comet metrics of the optional loss terms (Pix2Pix._gen_step extras); val = "" or "Val "."""
+    names = {
+        "flux_loss": f"Flux Consistency {val}Loss",
+        "flux_ratio": f"Flux Consistency {val}Ratio",
+        "noise_sigma": f"Noise Sigma {val}(batch median)",
+    }
+    return {names[key]: value.item() for key, value in extras.items()}
 
 
 def main():
@@ -193,6 +206,18 @@ def main():
             val_iter = iter(dataloader_val)
             return next(val_iter)
 
+    # Screening arms behind optional sections, off when absent: [CONSISTENCY] adds the flux
+    # consistency loss (neo/consistency.py), [NOISE] adds HST-like noise to the clean prediction
+    # before the discriminator (neo/noise.py; its template is cached in ckpt_dir)
+    consistency = noise = None
+    if ConsistencyLoss.enabled(config):
+        consistency = ConsistencyLoss.from_config(config, device)
+        experiment.log_parameters(consistency.parameters())
+    if NoiseModel.enabled(config):
+        noise = NoiseModel.from_config(config, device)
+        experiment.log_parameter("noise_sigma_default", noise.sigma_default)
+        experiment.log_parameter("noise_vgg_on", noise.vgg_on)
+
     # Initialize model; [MODEL] generator swaps in a different generator (default: the NEO U-Net)
     gen_name = generator_name(config)
     experiment.log_parameter("generator", gen_name)
@@ -205,6 +230,7 @@ def main():
         display_step=display_step, pretrained_generator=pretrained_generator,
         pretrained_discriminator=pretrained_discriminator,
         generator=None if gen_name == "neo" else make_generator(config),
+        consistency=consistency, noise=noise,
     )
     n_params = sum(p.numel() for p in pix2pix.gen.parameters())
     print(f"generator: {gen_name} ({n_params / 1e6:.1f} M parameters)")
@@ -236,7 +262,9 @@ def main():
             lr = lr.unsqueeze(1).to(device)
             seg_map_real = seg_map_real.unsqueeze(1).to(device)
 
-            # Generator step
+            # Generator step ([CONSISTENCY] ramps its weight over the first warmup_steps steps)
+            if consistency is not None:
+                consistency.step = cur_step
             losses = pix2pix.training_step(hr_real, lr, hsc_hr, seg_map_real, "generator")
             gen_loss = losses[0].item()
             adv_loss = losses[1].item()
@@ -259,7 +287,13 @@ def main():
                 "L1 Segmap Reconstruction Loss": segmap_loss,
                 "L1 Segmap/L1 Recon Ratio": segmap_loss / recon_loss,
                 "Adversarial Loss": adv_loss,
+                **extra_metrics(losses[5], ""),
             }, step=cur_step)
+            # a non-finite loss has already been backpropagated into the weights: stop before a
+            # checkpoint records them, so retry.sh / --resume restart from the last finite one
+            if not (math.isfinite(gen_loss) and math.isfinite(disc_loss)):
+                raise RuntimeError(f"non-finite loss at step {cur_step}: generator {gen_loss}, "
+                                   f"discriminator {disc_loss}")
 
             # Validation and logging
             if cur_step % display_step == 0 and cur_step > 0:
@@ -314,6 +348,17 @@ def main():
                     logit_max = max(np.abs(real_map).max(), np.abs(fake_map).max(), 1e-6)
                     log_figure(CenterCrop(100)(lr_val_img).detach().numpy(), "100x100 Conditioned Val Image (LR)", experiment, step=cur_step)
                     log_figure(sr_img, "600x600 Generated Val Image (SR)", experiment, set_lims=True, lims=hst_lims, step=cur_step)
+                    if pix2pix.noise is not None:
+                        # the SR figure above is the clean prediction; this is what the
+                        # discriminator saw: the prediction plus its target's sky noise
+                        crop = CenterCrop(600)
+                        sigma_val = pix2pix.noise.target_sigma(
+                            crop(hr_real_val[:1]), crop(seg_map_real_val[:1])
+                        )
+                        noisy_val = pix2pix.noise.add_noise(crop(fake_val_images[:1]), sigma_val)
+                        log_figure(noisy_val[0, 0].cpu().numpy(),
+                                   "600x600 Generated Val Image (SR + noise)",
+                                   experiment, set_lims=True, lims=hst_lims, step=cur_step)
                     log_figure(hst_img, "600x600 Real Val Image (HST)", experiment, set_lims=True, lims=hst_lims, step=cur_step)
                     log_figure(real_map, "Real Disc Val Logits", experiment, cmap="coolwarm", set_lims=True, lims=[-logit_max, logit_max], step=cur_step)
                     log_figure(fake_map, "Fake Disc Val Logits", experiment, cmap="coolwarm", set_lims=True, lims=[-logit_max, logit_max], step=cur_step)
@@ -327,6 +372,7 @@ def main():
                     "L1 Val Segmap Reconstruction Loss": segmap_val_loss,
                     "L1 Val Segmap/L1 Recon Ratio": segmap_val_loss / recon_val_loss,
                     "Adversarial Val Loss": adv_val_loss,
+                    **extra_metrics(val_losses[5], "Val "),
                 }, step=cur_step)
                 if records_activations:
                     # per block, the fraction of its batch-norm output <= 0, measured before dropout

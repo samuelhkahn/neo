@@ -16,11 +16,15 @@ pickled generator, never calls .eval() and uses batch_size=1). The default (eval
 checkpoints on select only (their L1 here, or compare.py --subset select); predict report only
 for the chosen checkpoint, so the reported numbers never influence the choice.
 
-Each output records its checkpoint (NEORUN, NEOCKPT, NEOSTEP), generator mode (NEOGMODE), units
-(BUNIT) and sky (PAIRID). An existing file is reused only when all of those match; anything else
-stops the run unless --overwrite is given, so predictions from another checkpoint, mode or pairs
-build cannot be mixed in. The run is tracked on Comet (neo.eval.tracking): parameters, the
-config, per-pair L1, example images, predictions.csv.
+--noise hst (models trained with [NOISE], neo.noise) adds an HST-like noise realisation at the
+config's default sky sigma to the clean prediction; the default, none, writes the clean image.
+
+Each output records its checkpoint (NEORUN, NEOCKPT, NEOSTEP), generator mode (NEOGMODE), noise
+(NEONOISE), units (BUNIT) and sky (PAIRID). An existing file is reused only when all of those
+match; anything else stops the run unless --overwrite is given, so predictions from another
+checkpoint, mode, noise choice or pairs build cannot be mixed in (a file without the NEONOISE card
+is a clean prediction from before the card existed, LEGACY_CARDS). The run is tracked on Comet
+(neo.eval.tracking): parameters, the config, per-pair L1, example images, predictions.csv.
 
 --samples K (K > 1, stochastic models only: diffusion, or a GAN with --gen-mode train) draws K
 samples per pair and writes <out>/single, <out>/mean, <out>/median (each a predictions directory
@@ -53,12 +57,16 @@ from neo.eval.postprocess import (  # noqa: E402
     njy_per_px,
     to_physical,
 )
-from neo.eval.predictors import build_predictor  # noqa: E402
+from neo.eval.predictors import NOISE_OPTIONS, build_predictor  # noqa: E402
 from neo.eval.subsets import SUBSETS, in_subset, load_groups, pair_id  # noqa: E402
 from neo.eval.tracking import start_experiment  # noqa: E402
 from neo.models.registry import generator_name  # noqa: E402
 
 N_EXAMPLES = 3
+# Cards added after the reuse check existed, with what their absence means: a prediction written
+# before NEONOISE was recorded can only be the clean output, so a default run reuses it (every
+# directory predicted on Lux so far) and --noise hst still refuses it.
+LEGACY_CARDS = {"NEONOISE": "none"}
 
 
 def pick_device(name: str) -> str:
@@ -114,6 +122,13 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--subset", choices=SUBSETS, default="all", help="val pairs to predict (module docstring)"
     )
     parser.add_argument(
+        "--noise",
+        choices=NOISE_OPTIONS,
+        default="none",
+        help="hst: add HST-like noise at the config default sigma to the clean prediction of a "
+        "model trained with [NOISE] (module docstring)",
+    )
+    parser.add_argument(
         "--samples",
         type=int,
         default=1,
@@ -167,7 +182,12 @@ def main(argv=None) -> None:
             return {}
         return {"NEOSTACK": kind, "NEOSAMPL": args.samples}
 
-    predict = build_predictor(config, args.checkpoint, device, mode=args.gen_mode)
+    # noise is passed only when asked for, so predictors without the option (other generators'
+    # builders, test stubs) keep their signature
+    options = {"mode": args.gen_mode}
+    if args.noise != "none":
+        options["noise"] = args.noise
+    predict = build_predictor(config, args.checkpoint, device, **options)
     print(f"device {device} | {len(order)} pairs from {split} -> {out}")
 
     identifier = config.get("IDENTIFIER", "identifier", fallback="").strip('"')
@@ -180,6 +200,7 @@ def main(argv=None) -> None:
         "NEOCKPT": checkpoint.name,
         "NEOSTEP": step,
         "NEOGMODE": args.gen_mode,
+        "NEONOISE": args.noise,
     }
     experiment = None
     if not args.no_comet:
@@ -201,6 +222,7 @@ def main(argv=None) -> None:
                 "batch_size": args.batch_size,
                 "seed": args.seed,
                 "gen_mode": args.gen_mode,
+                "noise": args.noise,
                 "samples": args.samples,
                 "device": device,
             }
@@ -220,7 +242,8 @@ def main(argv=None) -> None:
                     expected = {**source, "BUNIT": "nJy", "PAIRID": pair_id(hr_header)}
                     expected.update(stack_cards(kind))
                     header = fits.getheader(dirs[kind] / name)
-                    differs = {k: header.get(k) for k, v in expected.items() if header.get(k) != v}
+                    found = {k: header.get(k, LEGACY_CARDS.get(k)) for k in expected}
+                    differs = {k: found[k] for k, v in expected.items() if found[k] != v}
                     if differs:
                         raise SystemExit(
                             f"{dirs[kind] / name} exists but came from {differs}, not {expected}: "

@@ -399,12 +399,34 @@ def test_sweep_scores_and_averages_relu_arm_checkpoints(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     "arm, knob",
     [
-        ("neo_relu_d4", ("DATA_AUG", "augment", "shift_d4")),
-        ("neo_relu_cleand", ("DATASET", "hsc_hr_8bit", "none")),
+        ("neo_relu_d4", ("DATA_AUG", {"augment": "shift_d4"})),
+        ("neo_relu_cleand", ("DATASET", {"hsc_hr_8bit": "none"})),
+        # the code arms: a new section, absent from Arm A (neo/consistency.py, neo/noise.py)
+        (
+            "neo_relu_flux",
+            (
+                "CONSISTENCY",
+                {
+                    "lambda_consistency": None,
+                    "warmup_steps": None,
+                    "psf_lr_fwhm_arcsec": None,
+                    "psf_hr_fwhm_arcsec": "0.10",
+                    "flux_scale": None,
+                    "lr_noise_njy": "3.3",
+                    "edge_px": None,
+                },
+            ),
+        ),
+        (
+            "neo_relu_noise",
+            ("NOISE", {"add_noise": "true", "n_files": "32", "vgg_on": "noisy"}),
+        ),
     ],
 )
 def test_screening_configs_differ_from_arm_a_only_in_their_knob_and_length(arm, knob):
-    """Each screening arm is Arm A plus one change, trained for 300k steps."""
+    """Each screening arm is Arm A plus one change (a key, or a whole new section), trained for
+    300k steps. A value of None in the knob is checked for presence only (set from measurements,
+    tests/test_consistency.py covers their meaning)."""
     base = read_config(CONFIGS / "lux_neo_relu.ini")
     cfg = read_config(CONFIGS / f"lux_{arm}.ini")
     identifier = f"lux_cosmosweb_i_{arm}"
@@ -412,8 +434,14 @@ def test_screening_configs_differ_from_arm_a_only_in_their_knob_and_length(arm, 
     assert cfg["CHECKPOINT"]["ckpt_dir"] == "${NEO_DATA}/checkpoints/" + identifier
     assert cfg["COMET_TAG"]["comet_tag"].strip('"').endswith(f" {arm}")
     assert cfg["MODEL"]["generator"] == "neo_relu" and cfg["GAN_STEPS"]["gan_steps"] == "300000"
-    section, key, value = knob
-    assert cfg[section][key] == value
+    section, keys = knob
+    assert set(keys) <= set(cfg[section])
+    if section not in base:  # a new section: exactly these keys
+        assert set(cfg[section]) == set(keys)
+    for key, value in keys.items():
+        assert value is None or cfg[section][key] == value
+        if value is None:
+            float(cfg[section][key])  # a number, filled in
     differ = {
         (s, k)
         for s in base.keys() | cfg.keys()
@@ -425,5 +453,10 @@ def test_screening_configs_differ_from_arm_a_only_in_their_knob_and_length(arm, 
         ("CHECKPOINT", "ckpt_dir"),
         ("COMET_TAG", "comet_tag"),
         ("GAN_STEPS", "gan_steps"),
-        (section, key),
+        *((section, key) for key in keys),
     }
+    if arm in ("neo_relu_flux", "neo_relu_noise"):  # the code arms document their launch
+        header = (CONFIGS / f"lux_{arm}.ini").read_text().split("[DEFAULT]")[0]
+        assert "CONFIG_A=neo/configs/lux_neo_relu_flux.ini" in header
+        assert "CONFIG_B=neo/configs/lux_neo_relu_noise.ini" in header
+        assert "sbatch scripts/lux/train_pair.sbatch" in header

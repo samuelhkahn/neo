@@ -1,6 +1,7 @@
 """Evaluation units and --paper-mode: pairs in the paper's units (NJYPERPX) and older nJy pairs."""
 
 import csv
+import shutil
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ from test_eval import block_sum, gaussian
 
 from neo.data.dataset import SR_HST_HSC_Dataset
 from neo.eval import catalogs, compare, postprocess, predict
+from neo.eval.subsets import pair_id
 
 HR_PIX = 0.2 / 6
 HRSCALE = 152.7566058238  # nJy per e-/s at AB zeropoint 25.94
@@ -171,9 +173,12 @@ def test_paper_mode_refuses_options_it_sets():
 
 def test_paper_mode_flags_predictions_not_made_in_train_mode():
     args = compare.parse_args(["--split-dir", "x", "--pred", "m=y", "--out", "z", "--paper-mode"])
-    checkpoints = {"a": "r/s.pt/1/train", "b": "r/s.pt/1/eval", "c": "r/s.pt/1/None"}
+    checkpoints = {"a": "r/s.pt/1/train/none", "b": "r/s.pt/1/eval/hst", "c": "r/s.pt/1/None/none"}
     lines = compare.prediction_lines(args, checkpoints)
-    assert lines[0] == "Predictions: a = r/s.pt/1/train; b = r/s.pt/1/eval; c = r/s.pt/1/None."
+    expected = (
+        "Predictions: a = r/s.pt/1/train/none; b = r/s.pt/1/eval/hst; c = r/s.pt/1/None/none."
+    )
+    assert lines[0] == expected
     assert len(lines) == 2 and "for b (eval), c (None):" in lines[1]
     args.paper_mode = False
     assert compare.prediction_lines(args, checkpoints) == lines[:1]
@@ -253,6 +258,34 @@ def test_compare_rejects_predictions_left_in_paper_units(paper_split, njy_split)
                 compare.verify_predictions(split, {"m": pred}, [NAME])
 
 
+def test_compare_tells_clean_from_noisy_predictions_of_one_checkpoint(njy_split):
+    """predict.py --noise hst writes a second image set for the same checkpoint, differing only
+    by NEONOISE; a file without the card is a clean prediction from before the card existed."""
+    split = njy_split
+    second = "deep_coadd_test_val_00001.fits"
+    shutil.copy(split / "hr" / NAME, split / "hr" / second)
+    cards = {"BUNIT": "nJy", "PAIRID": pair_id(fits.getheader(split / "hr" / NAME))}
+    cards.update(NEORUN="r", NEOCKPT="s.pt", NEOSTEP=1, NEOGMODE="eval")
+
+    def write(directory, name, **noise):
+        directory.mkdir(exist_ok=True)
+        header = fits.Header({**cards, **noise})
+        image = fits.PrimaryHDU(np.zeros((600, 600), np.float32), header=header)
+        image.writeto(directory / name, overwrite=True)
+
+    clean, noisy, mixed = (split.parent / d for d in ("clean", "noisy", "mixed"))
+    write(clean, NAME)
+    write(clean, second, NEONOISE="none")
+    write(noisy, NAME, NEONOISE="hst")
+    write(noisy, second, NEONOISE="hst")
+    labels = compare.verify_predictions(split, {"c": clean, "n": noisy}, [NAME, second])
+    assert labels == {"c": "r/s.pt/1/eval/none", "n": "r/s.pt/1/eval/hst"}
+    write(mixed, NAME)
+    write(mixed, second, NEONOISE="hst")
+    with pytest.raises(SystemExit, match="mixes"):
+        compare.verify_predictions(split, {"m": mixed}, [NAME, second])
+
+
 def read_sources(out):
     with open(out / "sources.csv", newline="") as f:
         return list(csv.DictReader(f))
@@ -268,7 +301,7 @@ def test_compare_end_to_end_in_paper_units(monkeypatch, paper_split):
     assert "paper mode" in report and "npixels 71" in report and "FWHM 1.652 px" in report
     assert "q (paper code)" in report and (out / "paper_q.csv").exists()
     # predicted in eval mode: named, and flagged as not the paper's generator mode
-    assert "Predictions: neo = run/step_00000007.pt/7/eval." in report
+    assert "Predictions: neo = run/step_00000007.pt/7/eval/none." in report
     assert "Not the paper's generator mode for neo (eval)" in report
     rows = read_sources(out)
     assert len(rows) >= 3

@@ -10,7 +10,11 @@ with the same dropout masks and differences between checkpoints are paired.
 
 Per checkpoint it records the losses as training defines them (neo/pix2pix.py: L1, segmap L1 and
 VGG on the central 600 px in log space; adversarial and discriminator BCE with the checkpoint's own
-PatchGAN), averaged over images with standard errors, and the fine-structure metric
+PatchGAN), averaged over images with standard errors, and the fine-structure metric. For a run
+trained with [NOISE] (neo/noise.py) the clean output is scored, and the adversarial and
+discriminator columns judge it with the target's sky noise added, as training did (VGG stays on
+the clean output: the sweep compares checkpoints by what they produce, not by a noise draw); the
+same per-image seed also fixes that noise draw
 (neo.eval.fine_structure: transfer T, coherence rho and power ratio R inside HST sources, k50) on
 the images in nJy. --average A:B also scores the uniform average of the step files from A to B, a
 free stand-in for an EMA of the weights or a decaying learning rate.
@@ -51,6 +55,7 @@ from neo.eval.tracking import start_experiment  # noqa: E402
 from neo.models.patchgan import PatchGAN  # noqa: E402
 from neo.models.registry import check_generator, make_generator  # noqa: E402
 from neo.models.vgg19_loss import VGGLoss  # noqa: E402
+from neo.noise import NoiseModel  # noqa: E402
 
 STEP_FILE = re.compile(r"^step_(\d+)\.pt$")
 LOSSES = ("l1", "segmap_l1", "vgg", "adversarial", "discriminator")
@@ -141,8 +146,13 @@ def load_images(config, limit=None):
 
 
 @torch.no_grad()
-def evaluate(gen, disc, vgg, images, hst_sources, spectra, device, seed=0, mode="train"):
-    """Per-image losses and the pooled fine-structure result for one set of weights."""
+def evaluate(
+    gen, disc, vgg, images, hst_sources, spectra, device, seed=0, mode="train", noise=None
+):
+    """Per-image losses and the pooled fine-structure result for one set of weights.
+
+    noise: the run's NoiseModel ([NOISE]) or None; with it the discriminator sees the clean
+    output plus the target's sky noise, as in training."""
     gen.train(mode == "train")
     disc.train(mode == "train")
     bce = nn.BCEWithLogitsLoss()
@@ -157,7 +167,8 @@ def evaluate(gen, disc, vgg, images, hst_sources, spectra, device, seed=0, mode=
         s = crop(im["seg"][None, None].to(device))
         c = crop(im["hsc_hr"][None, None].to(device))
         err = (f - r).abs()
-        fake_logits, real_logits = disc(f, c).flatten(), disc(r, c).flatten()
+        judged = f if noise is None else noise.add_noise(f, noise.target_sigma(r, s))
+        fake_logits, real_logits = disc(judged, c).flatten(), disc(r, c).flatten()
         rows.append(
             {
                 "image": im["name"],
@@ -303,6 +314,10 @@ def main(argv=None):
     disc = PatchGAN(2).to(device)
     weights = eval(config["VGG_LOSS_WEIGHTS"]["vgg_loss_weights"])
     vgg = VGGLoss(device, weights=weights)
+    # the run's cached template (or [NOISE] template) only: never measure one from local pairs
+    noise = None
+    if NoiseModel.enabled(config):
+        noise = NoiseModel.from_config(config, device, measure=False)
     identifier = config.get("IDENTIFIER", "identifier", fallback="").strip('"')
 
     experiment = None
@@ -319,7 +334,7 @@ def main(argv=None):
         gen.load_state_dict(state["gen"])
         disc.load_state_dict(state["patch_gan"])
         rows, fine = evaluate(
-            gen, disc, vgg, images, hst_sources, spectra, device, args.seed, args.mode
+            gen, disc, vgg, images, hst_sources, spectra, device, args.seed, args.mode, noise
         )
         summary = summarize(label, step, rows, fine)
         append_rows(out / "sweep.csv", [summary])

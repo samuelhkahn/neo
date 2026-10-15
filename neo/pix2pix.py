@@ -43,6 +43,11 @@ class Pix2Pix:
         display_step: Logging frequency (in training steps).
         pretrained_generator: Filename of pretrained generator checkpoint (or empty string).
         pretrained_discriminator: Filename of pretrained discriminator checkpoint (or empty string).
+        generator: A drop-in replacement for the NEO U-Net (default: Pix2PixGenerator).
+        consistency: neo.consistency.ConsistencyLoss ([CONSISTENCY] in the config), or None.
+        noise: neo.noise.NoiseModel ([NOISE] in the config), or None. With it the generator
+            predicts a clean image: the discriminator (and VGG, if noise.vgg_on == "noisy") see
+            it with HST-like noise added, the L1 terms see it clean.
     """
 
     def __init__(self, in_channels, out_channels, device,
@@ -50,12 +55,15 @@ class Pix2Pix:
                  learning_rate=0.0002, disc_learning_rate=0.0002,
                  lambda_recon=200, lambda_segmap=200, lambda_vgg=200,
                  lambda_adv=5, display_step=25,
-                 pretrained_generator="", pretrained_discriminator="", generator=None):
+                 pretrained_generator="", pretrained_discriminator="", generator=None,
+                 consistency=None, noise=None):
 
         super().__init__()
 
         self.device = device
         self.display_step = display_step
+        self.consistency = consistency
+        self.noise = noise
 
         # Initialize generator (a drop-in replacement for the NEO U-Net may be passed in)
         if pretrained_generator:
@@ -113,24 +121,42 @@ class Pix2Pix:
         return torch.sum(((x_real - x_fake) * seg_map_real) ** 2.0) / torch.sum(seg_map_real)
 
     def _gen_step(self, real_images, conditioned_images, hsc_hr, seg_map_real):
-        """Compute generator loss with all components."""
-        fake_images = self.gen(conditioned_images)
+        """Compute generator loss with all components.
+
+        Returns (total, adversarial, L1, VGG, segmap L1, extras): extras is a dict of the optional
+        terms' values, empty unless [CONSISTENCY] / [NOISE] are on (flux_loss, flux_ratio,
+        noise_sigma).
+        """
+        output = self.gen(conditioned_images)  # the full 768 px output, for the forward model
 
         # Center crop to remove border artifacts
-        fake_images = CenterCrop(600)(fake_images)
+        fake_images = CenterCrop(600)(output)
         real_images = CenterCrop(600)(real_images)
         seg_map_real = CenterCrop(600)(seg_map_real)
         hsc_hr = CenterCrop(600)(hsc_hr)
 
+        extras = {}
+        # [NOISE]: the clean prediction gets its target's sky noise before the discriminator (and
+        # VGG, by default) so that the generator need not synthesise noise; the L1 terms below
+        # keep the clean image, whose optimum is then the clean conditional median
+        disc_input = vgg_input = fake_images
+        if self.noise is not None:
+            sigma = self.noise.target_sigma(real_images, seg_map_real)
+            noisy = self.noise.add_noise(fake_images, sigma)
+            disc_input = noisy
+            if self.noise.vgg_on == "noisy":
+                vgg_input = noisy
+            extras["noise_sigma"] = sigma.median().detach()
+
         # Adversarial loss
-        disc_logits = self.patch_gan(fake_images, hsc_hr)
+        disc_logits = self.patch_gan(disc_input, hsc_hr)
         adversarial_loss = self.adversarial_criterion(
             disc_logits.flatten(), torch.ones_like(disc_logits).flatten()
         )
 
         # Reconstruction losses
         recon_loss = self.recon_criterion_l1(fake_images, real_images)
-        vgg_loss = self.vgg_criterion(fake_images, real_images)
+        vgg_loss = self.vgg_criterion(vgg_input, real_images)
         segmap_loss = self.l1_loss_with_mask(fake_images, real_images, seg_map_real)
 
         # Weighted total loss
@@ -140,15 +166,22 @@ class Pix2Pix:
             + self.lambda_vgg * vgg_loss
             + self.lambda_segmap * segmap_loss
         )
+        # [CONSISTENCY]: the (clean) output through the LSST forward model against the LR input,
+        # weighted like the terms above (added separately so the default total is untouched)
+        if self.consistency is not None:
+            flux_loss, flux_ratio = self.consistency(output, conditioned_images, seg_map_real)
+            total_loss = total_loss + self.lr * (self.consistency.weight * flux_loss)
+            extras["flux_loss"] = flux_loss.detach()
+            extras["flux_ratio"] = flux_ratio
 
-        return total_loss, adversarial_loss, recon_loss, vgg_loss, segmap_loss
+        return total_loss, adversarial_loss, recon_loss, vgg_loss, segmap_loss, extras
 
     @torch.no_grad()
     def generate_fake_images(self, conditioned_images, identity_map=False):
         """Generate super-resolved images from low-resolution inputs."""
         return self.gen(conditioned_images)
 
-    def _disc_step(self, real_images, conditioned_images, hsc_hr):
+    def _disc_step(self, real_images, conditioned_images, hsc_hr, seg_map_real=None):
         """Compute discriminator loss on real and fake images."""
         fake_images = self.gen(conditioned_images).detach()
 
@@ -156,6 +189,12 @@ class Pix2Pix:
         fake_images = CenterCrop(600)(fake_images)
         real_images = CenterCrop(600)(real_images)
         hsc_hr = CenterCrop(600)(hsc_hr)
+
+        # [NOISE]: the discriminator judges the clean prediction plus a fresh noise realisation
+        # at the target's sky sigma, as in the generator step
+        if self.noise is not None:
+            sigma = self.noise.target_sigma(real_images, CenterCrop(600)(seg_map_real))
+            fake_images = self.noise.add_noise(fake_images, sigma)
 
         fake_logits = self.patch_gan(fake_images, hsc_hr)
         real_logits = self.patch_gan(real_images, hsc_hr)
@@ -179,11 +218,11 @@ class Pix2Pix:
             optimizer: Which model to train - "generator" or "discriminator".
 
         Returns:
-            For generator: (total_loss, adv_loss, recon_loss, vgg_loss, seg_loss)
+            For generator: (total_loss, adv_loss, recon_loss, vgg_loss, seg_loss, extras)
             For discriminator: (disc_loss, fake_logits, real_logits)
         """
         if optimizer == "discriminator":
-            loss, fake_logits, real_logits = self._disc_step(real, condition, hsc_hr)
+            loss, fake_logits, real_logits = self._disc_step(real, condition, hsc_hr, seg_map_real)
             self.disc_opt.zero_grad()
             loss.backward()
             self.disc_opt.step()
@@ -202,6 +241,6 @@ class Pix2Pix:
         Same interface and return values as ``training_step``.
         """
         if optimizer == "discriminator":
-            return self._disc_step(real, condition, hsc_hr)
+            return self._disc_step(real, condition, hsc_hr, seg_map_real)
         elif optimizer == "generator":
             return self._gen_step(real, condition, hsc_hr, seg_map_real)

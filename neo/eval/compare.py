@@ -260,10 +260,11 @@ def prediction_lines(args, checkpoints) -> list[str]:
     """table4.md lines naming each model's predictions; paper mode flags non-paper generator modes.
 
     The paper generated its SR images with the generator in train mode at batch size 1
-    (neo.eval.predict --gen-mode train); NEOGMODE is the last field of each checkpoint entry.
+    (neo.eval.predict --gen-mode train); NEOGMODE is the fourth field of each checkpoint entry
+    (run/checkpoint/step/mode/noise, verify_predictions).
     """
     lines = ["Predictions: " + "; ".join(f"{m} = {c}" for m, c in checkpoints.items()) + "."]
-    modes = {m: c.rsplit("/", 1)[-1] for m, c in checkpoints.items()}
+    modes = {m: c.split("/")[3] for m, c in checkpoints.items()}
     other = [f"{m} ({g})" for m, g in modes.items() if g != "train"]
     if args.paper_mode and other:
         lines.append(
@@ -295,9 +296,10 @@ def bias_figure(table4, title):
 def verify_predictions(split: Path, preds: dict, names: list) -> dict:
     """Each prediction must show its HR cutout's sky, and each directory hold one checkpoint.
 
-    Returns {model: "run/checkpoint/step/generator mode"}. Stops on predictions from another
-    pairs build, not in nJy, or a directory mixing checkpoints or generator modes, which would
-    otherwise be scored against the wrong cutouts or in the wrong units.
+    Returns {model: "run/checkpoint/step/generator mode/noise"}. Stops on predictions from
+    another pairs build, not in nJy, or a directory mixing checkpoints, generator modes or noise
+    choices (predict.py --noise), which would otherwise be scored against the wrong cutouts or
+    in the wrong units.
     """
     checkpoints = {}
     for model, directory in preds.items():
@@ -316,11 +318,15 @@ def verify_predictions(split: Path, preds: dict, names: list) -> dict:
                     f"{directory / name} is in {header.get('BUNIT')!r}, not nJy: predicted before "
                     "predict.py converted paper-unit pairs to nJy? Re-run predict.py."
                 )
-            keys = ("NEORUN", "NEOCKPT", "NEOSTEP", "NEOGMODE")
-            seen.add(tuple(str(header.get(k)) for k in keys))
+            keys = ("NEORUN", "NEOCKPT", "NEOSTEP", "NEOGMODE", "NEONOISE")
+            # a file without the NEONOISE card is a clean prediction from before the card existed
+            # (predict.LEGACY_CARDS)
+            legacy = {"NEONOISE": "none"}
+            seen.add(tuple(str(header.get(k, legacy.get(k))) for k in keys))
         if len(seen) != 1:
             raise SystemExit(
-                f"{directory} mixes predictions from several checkpoints or modes: {sorted(seen)}"
+                f"{directory} mixes predictions from several checkpoints, modes or noise choices: "
+                f"{sorted(seen)}"
             )
         checkpoints[model] = "/".join(seen.pop())
     return checkpoints
