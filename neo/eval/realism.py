@@ -49,9 +49,39 @@ well, as does, in paper mode, the clipped sky's positive mean: a copy 10% too br
 per cutout in default mode, +4,100 in paper mode. Compare it only between images whose skies share
 their noise. HST's own sky level is a term common to every model of a pair, and a mean stack's sky
 excess is the mean of its draws' (a sum over a fixed mask is linear).
+
+Gaia stars (neo.eval.stars): stars moved between the HST epoch and the LSST epoch, so an SR image
+that puts one where the LR image shows it would read as a ghost plus a miss. With a star mask
+(measure_pair star_mask=...; compare.py builds it from the cutout's WCS), SR detections and HST
+sources whose centroid falls in the mask are flagged near_star in realism_sr.csv / realism_hst.csv
+and counted in n_star_sr / n_star_hst. By default (set_aside=True, realism.csv stars_set_aside = 1)
+they are set aside: left out of every ghost, match, purity and completeness count, and the mask is
+taken out of the sky (sky area, sky excess). With compare.py --keep-stars (set_aside=False,
+stars_set_aside = 0) they keep their flags but count like any other source. n_gaia_stars is the
+number of catalog stars whose masks reach into the cutout, and empty when no catalog lookup was
+made for it (then realism.md says the stars were not checked rather than that there are none).
+
+Noise control, HST depth and bright ghosts: most ghosts at the HST threshold are bumps of the SR
+sky texture rather than invented galaxies (the 2026-10 survey found ghost counts equal to a
+phase-randomised noise control in every GAN run, concentrated in the deepest HST fields). So each
+cutout also records, per model, the detections on a noise control of the SR sky (noise_control:
+the sky pixels phase-randomised and rank-matched back to their own values, i.e. the SR sky's power
+spectrum and histogram with no sources; counted over the whole cutout), the HST sky sigma
+(hst_sky_sigma_njy, so realism.md bins ghosts by HST depth, terciles of that sigma), and the
+bright ghosts (peak more than BRIGHT_PEAK_SIGMA x the HST sky sigma above the SR image's own sky
+mean, with no HST segment, full or relaxed cut, within BRIGHT_RADIUS_ARCSEC), which sky texture at
+these thresholds does not make. The peak is taken above the SR sky mean because in --paper-mode
+the SR image is not background subtracted, so its sky level would otherwise count towards the
+height, and the HST sky sigma is the width of HST's sky around its own median.
+The sky the control is built from leaves out the bright ghosts' segments (dilated by the margin):
+they are invented sources, not texture, and their pixels would otherwise feed the control's
+bright tail; fainter ghosts stay in, since the control is meant to reproduce exactly those bumps.
+realism.md reports ghosts as the excess over the control (per arcmin^2, bootstrap CI), bright
+ghosts per arcmin^2, and both per depth bin.
 """
 
 import csv
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -72,6 +102,9 @@ AB_NJY = 31.4  # AB magnitude of 1 nJy
 # kron mag ~25 (local val: 17.2-25.2, median 23.4), so the bins resolve 21-25 rather than 23-27.
 MAG_EDGES = (21.0, 22.0, 23.0, 24.0, 25.0)
 N_BOOT = 1000
+BRIGHT_PEAK_SIGMA = 10.0  # a bright ghost peaks above this many HST sky sigmas...
+BRIGHT_RADIUS_ARCSEC = 0.5  # ...with no HST segment (either cut) within this radius
+N_DEPTH_BINS = 3  # cutouts binned at the terciles of the HST sky sigma
 
 PAIR_FIELDS = [
     "name",
@@ -93,6 +126,13 @@ PAIR_FIELDS = [
     "fwhm",
     "relaxed_threshold_njy",
     "relaxed_npixels",
+    "n_star_sr",
+    "n_star_hst",
+    "n_gaia_stars",
+    "stars_set_aside",
+    "hst_sky_sigma_njy",
+    "n_noise_control",
+    "n_bright_ghost",
 ]
 SR_FIELDS = [
     "name",
@@ -108,6 +148,9 @@ SR_FIELDS = [
     "hst_labels",
     "hst_flux_njy",
     "hst_snr",
+    "near_star",
+    "peak_njy",
+    "bright_ghost",
 ]
 HST_FIELDS = [
     "name",
@@ -119,6 +162,7 @@ HST_FIELDS = [
     "kron_flux_njy",
     "kron_mag",
     "mag_bin",
+    "near_star",
 ]
 FILES = ("realism.csv", "realism_sr.csv", "realism_hst.csv", "realism_summary.csv")
 
@@ -198,10 +242,24 @@ def as_array(values) -> np.ndarray:
     return np.array(getattr(values, "value", values), dtype=float, ndmin=1)
 
 
-def hst_sources(name: str, hst: np.ndarray, detected, edges=MAG_EDGES) -> list:
-    """HST_FIELDS rows of the sources HST shows at the full cut."""
+def in_mask(mask, x, y) -> np.ndarray:
+    """Whether each (x, y) position, rounded to a pixel, falls inside the boolean `mask` (all
+    False for mask None)."""
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    if mask is None or not ok.any():
+        return np.zeros(x.shape, dtype=bool)
+    ny, nx = mask.shape
+    col = np.clip(np.rint(np.where(ok, x, 0)), 0, nx - 1).astype(int)
+    row = np.clip(np.rint(np.where(ok, y, 0)), 0, ny - 1).astype(int)
+    return mask[row, col] & ok
+
+
+def hst_sources(name: str, hst: np.ndarray, detected, edges=MAG_EDGES, star_mask=None) -> list:
+    """HST_FIELDS rows of the sources HST shows at the full cut (near_star: inside star_mask)."""
     cat = catalog(hst, detected)
     x, y = positions(cat, detected[0].data)
+    near_star = in_mask(star_mask, x, y)
     kron = as_array(cat.kron_flux)
     mags = ab_mag(kron)
     bins = mag_bin(mags, edges)
@@ -217,6 +275,7 @@ def hst_sources(name: str, hst: np.ndarray, detected, edges=MAG_EDGES) -> list:
             "kron_flux_njy": float(kron[i]),
             "kron_mag": float(mags[i]),
             "mag_bin": int(bins[i]),
+            "near_star": int(near_star[i]),
         }
         for i, label in enumerate(cat.labels)
     ]
@@ -232,6 +291,39 @@ def sky_level(image: np.ndarray, sky: np.ndarray):
     return float(values.mean()), float(p84 - p50)
 
 
+def noise_control(image: np.ndarray, sky: np.ndarray, seed: int = 0) -> np.ndarray:
+    """A source-free image with the sky's power spectrum and pixel distribution.
+
+    The image, its sky mean taken out and its non-sky pixels set to that mean (zero), is Fourier
+    phase-randomised (the power spectrum, i.e. the texture's correlation structure, is kept;
+    everything else is scrambled), then every pixel is rank-matched to the sky pixels' own sorted
+    values, so the control has exactly the sky's histogram: the clipped pile at zero of a
+    paper-mode image, the stretched positive tail of a GAN sky. Detected with the cutout's
+    settings, it gives the detections the sky texture alone produces (the method of the 2026-10
+    survey tool, neo_outputs/scratch/all_experiments_quality/tool/quality.py noise_control, which
+    ran on background-subtracted panels; here a paper-mode SR image keeps its sky level, so the
+    holes must be filled at that level or their edges would be scrambled into texture). All zeros
+    when there is no sky.
+    """
+    image = np.asarray(image, dtype=np.float64)
+    values = np.sort(image[sky])
+    if not len(values):
+        return np.zeros_like(image)
+    rng = np.random.default_rng(seed)
+    spectrum = np.abs(np.fft.fft2(np.where(sky, image - values.mean(), 0.0)))
+    phases = np.exp(2j * np.pi * rng.random(image.shape))
+    scrambled = np.fft.ifft2(spectrum * phases).real
+    ranks = np.argsort(np.argsort(scrambled, axis=None, kind="stable"), kind="stable")
+    quantile = (ranks + 0.5) / ranks.size
+    grid = (np.arange(values.size) + 0.5) / values.size
+    return np.interp(quantile, grid, values).reshape(image.shape)
+
+
+def control_seed(name: str) -> int:
+    """One seed per cutout, so every model's control shares the same random phases."""
+    return int(hashlib.md5(name.encode()).hexdigest(), 16) % 2**32
+
+
 def measure_pair(
     name: str,
     hst: np.ndarray,
@@ -245,6 +337,11 @@ def measure_pair(
     edges=MAG_EDGES,
     hst_raw: np.ndarray | None = None,
     srs_raw: dict | None = None,
+    star_mask: np.ndarray | None = None,
+    n_stars: int | None = None,
+    set_aside: bool = True,
+    bright_sigma: float = BRIGHT_PEAK_SIGMA,
+    bright_radius_arcsec: float = BRIGHT_RADIUS_ARCSEC,
 ) -> dict:
     """Realism record of one cutout: {"pairs": per-model rows, "sr": SR detections, "hst": HST
     sources}, plain picklable rows (PAIR_FIELDS, SR_FIELDS, HST_FIELDS + recovered:<model>).
@@ -254,45 +351,74 @@ def measure_pair(
     SR image is detected with the same threshold, npixels and fwhm; HST, and SR images that miss
     an HST source, again at the relaxed cut (relaxed()). `hst_raw` and `srs_raw` are the same
     images before any background subtraction, for the sky excess (default: as cataloged).
+    `star_mask` (neo.eval.stars.star_mask) flags the sources inside it; with `set_aside` they are
+    set aside and the mask is taken out of the sky, otherwise they count like any other (module
+    docstring). `n_stars` is the number of catalog stars behind the mask, None when the cutout
+    was not checked against the catalog. The noise control and the bright ghosts are always
+    recorded; `bright_sigma` and `bright_radius_arcsec` define a bright ghost.
     """
     hst_raw = hst if hst_raw is None else hst_raw
     srs_raw = srs if srs_raw is None else srs_raw
     radius = margin_arcsec / pixel_arcsec
     structure = disk(radius)
+    wide = disk(bright_radius_arcsec / pixel_arcsec)
     loose = relaxed(threshold, npixels)
     hst_labels = segment_labels(detected, hst.shape)
     hst_loose = segment_labels(detect_hst(hst, *loose, fwhm), hst.shape)
-    hst_rows = [] if detected is None else hst_sources(name, hst, detected, edges)
+    hst_any = np.where(hst_labels > 0, hst_labels, hst_loose)  # either cut, for bright ghosts
+    hst_rows = [] if detected is None else hst_sources(name, hst, detected, edges, star_mask)
+    star_labels = {row["label"] for row in hst_rows if row["near_star"]}  # flagged near a star
+    aside = star_labels if set_aside else set()  # ... and left out of the counts
+    n_hst = len(hst_rows) - len(aside)
     # every pixel above the full cut is also above the relaxed one; the union only guards against
     # deblending assigning a few of them differently
     footprint = ndimage.binary_dilation((hst_labels > 0) | (hst_loose > 0), structure=structure)
     sky = ~footprint
+    if star_mask is not None and set_aside:
+        sky &= ~star_mask  # a star's disk is neither source nor sky: nothing in it counts
     arcmin2_per_px = pixel_arcsec**2 / 3600
     area_arcmin2 = hst.size * arcmin2_per_px
     sky_area = float(sky.sum() * arcmin2_per_px)
     mean, sigma = sky_level(hst, sky)
     noise = sigma if sigma > 0 else float("nan")  # a sky clipped to mostly zeros has no width
+    seed = control_seed(name)
 
     pair_rows, sr_rows = [], []
     for model, sr in srs.items():
         recovered = set()
-        n_ghost, n_loose, ghost_flux = 0, 0, 0.0
+        n_ghost, n_loose, n_star, n_bright, ghost_flux = 0, 0, 0, 0, 0.0
         found = detect_hst(sr, threshold, npixels, fwhm)  # the HST detection, run on this SR image
+        sr_mean = sky_level(sr, sky)[0]  # a bright ghost's peak is measured above the SR sky
         if found is not None:
             cat = catalog(sr, found)
             x, y = positions(cat, found[0].data)
             flux, area = as_array(cat.segment_flux), as_array(cat.area)
             mags = ab_mag(flux)
+            labels = np.asarray(cat.labels)
+            peaks = np.asarray(ndimage.maximum(sr, found[0].data, labels), dtype=float)
             # what HST holds under each SR segment, above its mean sky (clipped noise in paper mode)
-            under = ndimage.sum_labels(hst, found[0].data, np.asarray(cat.labels)) - mean * area
+            under = ndimage.sum_labels(hst, found[0].data, labels) - mean * area
             near = labels_near(hst_labels, x, y, structure)
             near_loose = labels_near(hst_loose, x, y, structure)
+            near_wide = labels_near(hst_any, x, y, wide)
+            starred = in_mask(star_mask, x, y)
+            bright_labels = []
             for i, label in enumerate(cat.labels):
+                recovered.update(int(v) for v in near[i])
                 loose_only = not len(near[i]) and len(near_loose[i]) > 0
                 ghost = not len(near[i]) and not len(near_loose[i])
-                recovered.update(int(v) for v in near[i])
+                if starred[i]:
+                    n_star += 1
+                    if set_aside:  # neither a ghost nor a match
+                        loose_only = ghost = False
+                bright = (
+                    ghost and peaks[i] - sr_mean > bright_sigma * noise and not len(near_wide[i])
+                )
                 n_ghost += int(ghost)
                 n_loose += int(loose_only)
+                n_bright += int(bright)
+                if bright:
+                    bright_labels.append(int(label))
                 ghost_flux += float(flux[i]) if ghost else 0.0
                 sr_rows.append(
                     {
@@ -309,23 +435,32 @@ def measure_pair(
                         "hst_labels": ";".join(str(int(v)) for v in near[i]),
                         "hst_flux_njy": float(under[i]),
                         "hst_snr": float(under[i] / (noise * np.sqrt(area[i]))),
+                        "near_star": int(starred[i]),
+                        "peak_njy": float(peaks[i]),
+                        "bright_ghost": int(bright),
                     }
                 )
-        if len(recovered) < len(hst_rows):  # a source missed at the full cut may show below it
+        if len(recovered - aside) < n_hst:  # a source missed at the full cut may show below it
             found_loose = detect_hst(sr, *loose, fwhm)
             if found_loose is not None:
                 x, y = positions(catalog(sr, found_loose), found_loose[0].data)
                 for labels in labels_near(hst_labels, x, y, structure):
                     recovered.update(int(v) for v in labels)
-        n_sr = 0 if found is None else found[0].nlabels
+        n_sr = (0 if found is None else found[0].nlabels) - (n_star if set_aside else 0)
         for row in hst_rows:
             row[f"recovered:{model}"] = int(row["label"] in recovered)
+        recovered -= aside
         excess = float(np.sum((np.asarray(srs_raw[model], dtype=float) - hst_raw)[sky]))
+        control_sky = sky
+        if found is not None and bright_labels:  # invented sources are not sky texture
+            segments = np.isin(found[0].data, bright_labels)
+            control_sky = sky & ~ndimage.binary_dilation(segments, structure=structure)
+        control = detect_hst(noise_control(sr, control_sky, seed), threshold, npixels, fwhm)
         pair_rows.append(
             {
                 "name": name,
                 "model": model,
-                "n_hst": len(hst_rows),
+                "n_hst": n_hst,
                 "n_sr": n_sr,
                 "n_matched": n_sr - n_ghost,
                 "n_relaxed_only": n_loose,
@@ -342,6 +477,13 @@ def measure_pair(
                 "fwhm": fwhm,
                 "relaxed_threshold_njy": loose[0],
                 "relaxed_npixels": loose[1],
+                "n_star_sr": n_star,
+                "n_star_hst": len(star_labels),
+                "n_gaia_stars": None if n_stars is None else int(n_stars),
+                "stars_set_aside": int(set_aside),
+                "hst_sky_sigma_njy": sigma,
+                "n_noise_control": 0 if control is None else int(control[0].nlabels),
+                "n_bright_ghost": n_bright,
             }
         )
     return {"pairs": pair_rows, "sr": sr_rows, "hst": hst_rows}
@@ -394,6 +536,31 @@ def median(values, weights) -> dict:
     return interval(float(np.median(v)), boot, int(ok.sum()))
 
 
+def excess(ghosts, sky_area, control, area, weights, n) -> dict:
+    """sum(ghosts) / sum(sky_area) - sum(control) / sum(area) over cutouts, with its bootstrap
+    CI: ghosts per arcmin^2 of sky beyond what the noise control (over the whole cutout) gives."""
+    ghosts, sky_area = np.asarray(ghosts, dtype=float), np.asarray(sky_area, dtype=float)
+    control, area = np.asarray(control, dtype=float), np.asarray(area, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        point = ghosts.sum() / sky_area.sum() - control.sum() / area.sum()
+        boot = (weights @ ghosts) / (weights @ sky_area) - (weights @ control) / (weights @ area)
+    return interval(
+        float(point) if sky_area.sum() > 0 and area.sum() > 0 else float("nan"), boot, n
+    )
+
+
+def depth_bins(sigma, n_bins: int = N_DEPTH_BINS):
+    """Bin index per cutout (0 = deepest, lowest HST sky sigma; -1 without a sigma) at the
+    quantiles of the finite sigmas, and the bin edges."""
+    sigma = np.asarray(sigma, dtype=float)
+    finite = np.isfinite(sigma)
+    if not finite.any():
+        return np.full(sigma.shape, -1), []
+    edges = np.percentile(sigma[finite], np.linspace(0, 100, n_bins + 1)[1:-1])
+    index = np.digitize(np.where(finite, sigma, 0), edges)
+    return np.where(finite, index, -1), [float(e) for e in edges]
+
+
 def summarize(found: dict, models, groups=None, edges=MAG_EDGES, n_boot=N_BOOT, seed=0) -> list:
     """Per model: counts and {statistic: {value, ci_lo, ci_hi, n}} over the cutouts in `found`.
 
@@ -406,12 +573,28 @@ def summarize(found: dict, models, groups=None, edges=MAG_EDGES, n_boot=N_BOOT, 
     hst = found["hst"]
     where = np.array([index[r["name"]] for r in hst], dtype=int)
     bins = np.array([r["mag_bin"] for r in hst], dtype=int)
+    # HST sources near Gaia stars are set aside from the completeness bins too, unless the cutout
+    # was measured with the stars counted (compare.py --keep-stars: stars_set_aside = 0)
+    aside = {}
+    for r in found["pairs"]:
+        aside.setdefault(r["name"], r.get("stars_set_aside", 1))
+    near = np.array([r.get("near_star", 0) for r in hst], dtype=float) > 0
+    set_aside = np.array([aside.get(r["name"], 1) for r in hst], dtype=float) > 0
+    bins = np.where(near & set_aside, -1, bins)
     per_bin = np.zeros((len(names), len(labels)))
     np.add.at(per_bin, (where[bins >= 0], bins[bins >= 0]), 1)
+    # the HST sky sigma is a property of the cutout: the same in every model's row
+    by_name = {}
+    for r in found["pairs"]:
+        by_name.setdefault(r["name"], r)
+    depth, depth_edges = depth_bins([by_name[n].get("hst_sky_sigma_njy", np.nan) for n in names])
     summary = []
     for model in models:
         rows = {r["name"]: r for r in found["pairs"] if r["model"] == model}
-        col = {k: np.array([rows[n][k] for n in names], dtype=float) for k in PAIR_FIELDS[2:]}
+        col = {
+            k: np.array([rows[n].get(k, np.nan) for n in names], dtype=float)
+            for k in PAIR_FIELDS[2:]
+        }
         ghosts = [r["mag"] for r in found["sr"] if r["model"] == model and r["ghost"]]
         ghost_mags = np.asarray(ghosts, dtype=float)
         ghost_mags = ghost_mags[np.isfinite(ghost_mags)]
@@ -430,6 +613,35 @@ def summarize(found: dict, models, groups=None, edges=MAG_EDGES, n_boot=N_BOOT, 
         for b, label in enumerate(labels):
             stats[f"completeness_{label}"] = ratio(rec_bin[:, b], per_bin[:, b], weights)
         stats["sky_excess_njy_per_arcmin2"] = median(col["sky_excess_njy_per_arcmin2"], weights)
+        # ghosts against the noise control and by HST depth; the control is counted over the
+        # whole cutout, ghosts over its sky
+        n = len(names)
+        ghost, sky, ctrl, area = (
+            np.nan_to_num(col[k])
+            for k in ("n_ghost", "sky_area_arcmin2", "n_noise_control", "area_arcmin2")
+        )
+        bright = np.nan_to_num(col["n_bright_ghost"])
+        stats["noise_ghosts_per_arcmin2"] = ratio(ctrl, area, weights, n)
+        stats["ghost_excess_per_arcmin2"] = excess(ghost, sky, ctrl, area, weights, n)
+        stats["bright_ghosts_per_arcmin2"] = ratio(bright, sky, weights, n)
+        depth_n, depth_sigma = [], []
+        for b in range(N_DEPTH_BINS):
+            inb = (depth == b).astype(float)
+            n_b = int(inb.sum())
+            depth_n.append(n_b)
+            sig_b = col["hst_sky_sigma_njy"][depth == b]
+            depth_sigma.append([float(sig_b.min()), float(sig_b.max())] if n_b else [np.nan] * 2)
+            stats[f"ghosts_per_arcmin2_depth{b + 1}"] = ratio(ghost * inb, sky * inb, weights, n_b)
+            stats[f"noise_ghosts_per_arcmin2_depth{b + 1}"] = ratio(
+                ctrl * inb, area * inb, weights, n_b
+            )
+            stats[f"ghost_excess_per_arcmin2_depth{b + 1}"] = excess(
+                ghost * inb, sky * inb, ctrl * inb, area * inb, weights, n_b
+            )
+            stats[f"bright_ghosts_per_arcmin2_depth{b + 1}"] = ratio(
+                bright * inb, sky * inb, weights, n_b
+            )
+        stars = np.nan_to_num(col["n_gaia_stars"])  # NaN: the cutout was not checked
         summary.append(
             {
                 "model": model,
@@ -442,6 +654,17 @@ def summarize(found: dict, models, groups=None, edges=MAG_EDGES, n_boot=N_BOOT, 
                 "n_relaxed_only": int(col["n_relaxed_only"].sum()),
                 "n_ghost": int(col["n_ghost"].sum()),
                 "ghost_mag_median": float(np.median(ghost_mags)) if len(ghost_mags) else None,
+                "n_bright_ghost": int(bright.sum()),
+                "n_noise_control": int(ctrl.sum()),
+                "n_star_sr": int(np.nan_to_num(col["n_star_sr"]).sum()),
+                "n_star_hst": int(np.nan_to_num(col["n_star_hst"]).sum()),
+                "n_gaia_stars": int(stars.sum()),
+                "n_cutouts_with_stars": int((stars > 0).sum()),
+                "stars_checked": bool(np.isfinite(col["n_gaia_stars"]).any()),
+                "stars_set_aside": bool(np.all(np.nan_to_num(col["stars_set_aside"], nan=1) > 0)),
+                "depth_edges": depth_edges,
+                "depth_n": depth_n,
+                "depth_sigma": depth_sigma,
                 "stats": stats,
             }
         )
@@ -532,6 +755,78 @@ def report_lines(
     for s in summary:
         cells = " | ".join(cell(s["stats"][f"completeness_{b}"]) for b in labels)
         lines.append(f"| {s['model']} | {cells} |")
+    lines += [
+        "",
+        "Ghosts against a noise control. Each SR image's sky (outside the dilated HST maps, the "
+        "star masks that are set aside, and the segments of its bright ghosts dilated by the "
+        "margin) is Fourier phase-randomised and rank-matched back to its own pixel values: a "
+        "source-free image with the SR sky's power spectrum and histogram. Detected with the "
+        "same settings, it gives the detections sky texture alone produces (counted over the "
+        "whole cutout, per arcmin^2). Excess = ghosts per arcmin^2 of sky - control detections "
+        "per arcmin^2. The pixels of fainter ghosts stay in the sky the control is made from, so "
+        "invented faint compact sources feed the control's histogram too: the excess is a lower "
+        "bound on invented sources, which is why bright ghosts are counted directly. Bright "
+        f"ghosts: peak more than {BRIGHT_PEAK_SIGMA:g} x the HST sky sigma above the SR image's "
+        "own sky mean, with no HST segment (full or relaxed cut) within "
+        f'{BRIGHT_RADIUS_ARCSEC:g}", which sky texture at these thresholds does not make.',
+        "",
+        "| model | ghosts / arcmin^2 sky | noise control / arcmin^2 | excess / arcmin^2 | "
+        "bright ghosts | bright ghosts / arcmin^2 |",
+        "|" + "---|" * 6,
+    ]
+    for s in summary:
+        st = s["stats"]
+        lines.append(
+            f"| {s['model']} | {cell(st['ghosts_per_arcmin2'])} | "
+            f"{cell(st['noise_ghosts_per_arcmin2'])} | {cell(st['ghost_excess_per_arcmin2'])} | "
+            f"{s['n_bright_ghost']} | {cell(st['bright_ghosts_per_arcmin2'])} |"
+        )
+    lines += [
+        "",
+        f"Ghosts by HST depth: cutouts split into {N_DEPTH_BINS} bins at the quantiles of the HST "
+        "sky sigma (nJy per HR px; depth 1 is the deepest, lowest sigma; n = cutouts):",
+        "",
+        "| model | depth (sigma range, n) | ghosts / arcmin^2 sky | noise control / arcmin^2 | "
+        "excess / arcmin^2 | bright ghosts / arcmin^2 |",
+        "|" + "---|" * 6,
+    ]
+    for s in summary:
+        st = s["stats"]
+        for b in range(N_DEPTH_BINS):
+            lo, hi = s["depth_sigma"][b]
+            span_b = f"{lo:.3g}-{hi:.3g}" if np.isfinite(lo) else "n/a"
+            lines.append(
+                f"| {s['model']} | {b + 1} ({span_b}, n={s['depth_n'][b]}) | "
+                f"{cell(st[f'ghosts_per_arcmin2_depth{b + 1}'])} | "
+                f"{cell(st[f'noise_ghosts_per_arcmin2_depth{b + 1}'])} | "
+                f"{cell(st[f'ghost_excess_per_arcmin2_depth{b + 1}'])} | "
+                f"{cell(st[f'bright_ghosts_per_arcmin2_depth{b + 1}'])} |"
+            )
+    per_model = ", ".join(f"{s['model']} {s['n_star_sr']}" for s in summary)
+    if first["n_gaia_stars"]:
+        inside = (
+            f"{first['n_star_hst']} HST sources, and SR detections per model: {per_model} "
+            "(near_star in realism_hst.csv / realism_sr.csv)."
+        )
+        lines += [
+            "",
+            f"Gaia DR3 stars (neo/eval/stars.py): {first['n_gaia_stars']} in "
+            f"{first['n_cutouts_with_stars']} of the {n} cutouts, each masked around both its "
+            "HST-epoch and LSST-epoch positions (the mask radius is stated above). "
+            + (
+                f"Set aside from every count above: {inside}"
+                if first["stars_set_aside"]
+                else f"Counted like any other source (--keep-stars): {inside}"
+            ),
+        ]
+    elif first["stars_checked"]:
+        lines += ["", "Gaia DR3 stars (neo/eval/stars.py): none in these cutouts."]
+    else:
+        lines += [
+            "",
+            "Gaia DR3 stars (neo/eval/stars.py): not checked (no star masks were built, so any "
+            "source inside one is counted like any other).",
+        ]
     return lines
 
 
