@@ -26,11 +26,14 @@ checkpoint, mode, noise choice or pairs build cannot be mixed in (a file without
 is a clean prediction from before the card existed, LEGACY_CARDS). The run is tracked on Comet
 (neo.eval.tracking): parameters, the config, per-pair L1, example images, predictions.csv.
 
---samples K (K > 1, stochastic models only: diffusion, or a GAN with --gen-mode train) draws K
-samples per pair and writes <out>/single, <out>/mean, <out>/median (each a predictions directory
-for compare.py, with its own predictions.csv) and <out>/std (per-pixel spread of the draws, nJy);
-see neo.eval.stack. Their files also record NEOSTACK (which stack) and NEOSAMPL (K), and the
-example figures compare one draw with the stacks.
+--samples K (or --ensemble K; K > 1, stochastic models only: diffusion, or a GAN with --gen-mode
+train, whose dropout makes every pass a draw) draws K samples per pair and writes <out>/single,
+<out>/mean, <out>/median (each a predictions directory for compare.py, with its own
+predictions.csv) and <out>/std (per-pixel spread of the draws, nJy); see neo.eval.stack. Their
+files also record NEOSTACK (which stack) and NEOSAMPL (K), and the example figures compare one
+draw with the stacks. Draw k of the batch starting at pair i (in name order) is seeded with
+seed + i + 1000 k, so a pair's draws do not depend on how many pairs before it were predicted,
+reused or skipped in this run (at batch size 1 these are the seeds neo.eval.sweep uses).
 """
 
 import argparse
@@ -130,8 +133,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--samples",
+        "--ensemble",
+        dest="samples",
         type=int,
         default=1,
+        metavar="K",
         help="draws per pair; K > 1 writes single/mean/median/std stacks (module docstring)",
     )
     parser.add_argument("--overwrite", action="store_true", help="replace existing predictions")
@@ -260,7 +266,13 @@ def main(argv=None) -> None:
             continue
         lr = torch.stack([b[2] for b in batch]).unsqueeze(1)
         cond = torch.stack([b[3] for b in batch]).unsqueeze(1).to(device)
-        draws = torch.stack([predict(lr, cond).detach().float().cpu() for _ in range(args.samples)])
+        draws = []
+        for k in range(args.samples):
+            # a fixed seed per batch position and draw (module docstring): dropout masks and
+            # sampler noise of a pair never depend on what was predicted or reused before it
+            torch.manual_seed(args.seed + start + 1000 * k)
+            draws.append(predict(lr, cond).detach().float().cpu())
+        draws = torch.stack(draws)
         images = stack.stack(draws) if args.samples > 1 else {None: draws[0]}
         for j, (name, hst, hsc, _, hr_header) in enumerate(batch):
             target = hst.numpy()

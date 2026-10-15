@@ -3,6 +3,8 @@
 import matplotlib
 
 matplotlib.use("Agg")
+import shutil  # noqa: E402
+
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
@@ -11,6 +13,7 @@ from test_eval_units import NAME, NJY_HR, write_pair  # noqa: E402
 
 from neo.data.dataset import SR_HST_HSC_Dataset  # noqa: E402
 from neo.eval import postprocess, predict, stack  # noqa: E402
+from neo.models.generator import Pix2PixGenerator  # noqa: E402
 
 
 def test_log_linear_round_trip_matches_the_dataset_scaling():
@@ -144,6 +147,49 @@ def test_samples_refused_for_a_deterministic_generator(monkeypatch, tmp_path):
         monkeypatch, split, tmp_path / "pred", 2, "neo", "--gen-mode", "train", "--batch-size", "1"
     )
     assert fits.getheader(tmp_path / "pred" / "median" / NAME)["NEOGMODE"] == "train"
+
+
+def write_gan_checkpoint(path):
+    torch.manual_seed(0)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    gen = Pix2PixGenerator(1, 1)
+    torch.save({"step": 7, "generator": "neo", "gen": gen.state_dict()}, path)
+
+
+def test_a_gan_in_train_mode_draws_differ_and_each_pair_is_seeded_on_its_own(tmp_path):
+    """--ensemble K on the real NEO generator with dropout on: K different draws per pair, the
+    stacks written like a diffusion model's, and a pair's draws fixed by its position in name
+    order, so reusing the pairs before it changes nothing."""
+    split = write_pair(tmp_path / "val", "paper")
+    second = "deep_coadd_test_val_00001.fits"
+    write_pair(tmp_path / "val", "paper", name=second)
+    ckpt = tmp_path / "run" / "step_00000007.pt"
+    write_gan_checkpoint(ckpt)
+    config = tmp_path / "train.ini"
+    config.write_text("[MODEL]\ngenerator = neo\n")
+    args = ["--config", str(config), "--checkpoint", str(ckpt), "--split-dir", str(split)]
+    args += ["--device", "cpu", "--no-comet", "--gen-mode", "train", "--batch-size", "1"]
+    out = tmp_path / "pred"
+    predict.main([*args, "--out", str(out), "--ensemble", "3"])
+    images = {kind: fits.getdata(out / kind / NAME) for kind in stack.KINDS}
+    header = fits.getheader(out / "median" / NAME)
+    assert header["NEOSAMPL"] == 3 and header["NEOGMODE"] == "train" and header["BUNIT"] == "nJy"
+    assert images["std"].max() > 0 and not np.array_equal(images["single"], images["median"])
+    assert not np.array_equal(images["mean"], images["median"])
+    # the second pair alone, with the first pair's files already there: identical draws
+    again = tmp_path / "again"
+    for kind in stack.KINDS:
+        (again / kind).mkdir(parents=True)
+        shutil.copy(out / kind / NAME, again / kind / NAME)
+    predict.main([*args, "--out", str(again), "--samples", "3"])
+    for kind in stack.KINDS:
+        np.testing.assert_array_equal(
+            fits.getdata(out / kind / second), fits.getdata(again / kind / second)
+        )
+    # and another seed gives other draws
+    other = tmp_path / "other"
+    predict.main([*args, "--out", str(other), "--samples", "3", "--seed", "1", "--limit", "1"])
+    assert not np.array_equal(fits.getdata(other / "single" / NAME), images["single"])
 
 
 def test_parse_sizes():

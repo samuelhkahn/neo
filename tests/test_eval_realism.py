@@ -7,6 +7,7 @@ import pytest
 from astropy.io import fits
 from conftest import make_tan_wcs
 from scipy import ndimage
+from scipy.ndimage import gaussian_filter
 from test_eval import gaussian, scene_images
 from test_eval_units import HR_PIX, HRSCALE, NAME, run_predict, write_pair
 
@@ -35,14 +36,15 @@ def noise(seed=0):
     return np.random.default_rng(seed).normal(0, 0.25, SHAPE)
 
 
-def measure(hst, srs, margin=realism.MARGIN_ARCSEC):
+def measure(hst, srs, margin=realism.MARGIN_ARCSEC, name=NAME, **options):
     """Realism of one cutout as compare.py's default mode measures it: detection on the images
-    SEP background subtracted, sky excess on the images as given."""
+    SEP background subtracted, sky excess on the images as given; `options` (star_mask, ...) go
+    to measure_pair."""
     prepared = {k: postprocess.subtract_background(v) for k, v in srs.items()}
     hst_prepared = postprocess.subtract_background(hst)
     detected = catalogs.detect_hst(hst_prepared, THRESHOLD, catalogs.NPIXELS)
     return realism.measure_pair(
-        NAME,
+        name,
         hst_prepared,
         prepared,
         detected,
@@ -53,7 +55,13 @@ def measure(hst, srs, margin=realism.MARGIN_ARCSEC):
         margin,
         hst_raw=hst,
         srs_raw=srs,
+        **options,
     )
+
+
+def merge(*founds):
+    """One found dict holding the cutouts of several measure() results."""
+    return {key: [r for f in founds for r in f[key]] for key in ("pairs", "sr", "hst")}
 
 
 def stats(found, model, groups=None):
@@ -69,6 +77,12 @@ def test_identical_image_is_pure_complete_and_adds_no_sky_flux():
     assert row["n_ghost"] == 0 and row["ghost_flux_njy"] == 0 and row["sky_excess_njy"] == 0
     assert row["n_relaxed_only"] == 0
     assert row["margin_px"] == pytest.approx(6.0)
+    # the new columns, with nothing to report: no star mask (and no catalog lookup, so the star
+    # count is empty rather than 0), no bright ghost, a quiet control
+    assert (row["n_star_sr"], row["n_star_hst"], row["n_gaia_stars"]) == (0, 0, None)
+    assert row["stars_set_aside"] == 1
+    assert row["n_bright_ghost"] == 0 and row["n_noise_control"] == 0
+    assert row["hst_sky_sigma_njy"] == pytest.approx(0.25, rel=0.1)
     settings = [row[k] for k in ("threshold_njy", "npixels", "fwhm")]
     assert settings == [THRESHOLD, catalogs.NPIXELS, catalogs.KERNEL_FWHM]
     assert (row["relaxed_threshold_njy"], row["relaxed_npixels"]) == (THRESHOLD / 2, 25)
@@ -98,6 +112,9 @@ def test_an_injected_ghost_is_one_ghost_with_its_flux():
     assert (ghost["ycentroid"], ghost["xcentroid"]) == pytest.approx(GHOST[:2], abs=0.5)
     assert ghost["mag"] == pytest.approx(31.4 - 2.5 * np.log10(GHOST_FLUX), abs=0.1)
     assert ghost["hst_labels"] == "" and not ghost["relaxed_only"]
+    # 20 nJy against a 0.25 nJy sky, far from every HST source: a bright ghost
+    assert ghost["bright_ghost"] == 1 and ghost["peak_njy"] == pytest.approx(20.0, rel=0.05)
+    assert row["n_bright_ghost"] == 1 and not ghost["near_star"]
     assert abs(ghost["hst_snr"]) < 4  # HST shows only noise there
     assert all(r["hst_labels"] for r in found["sr"] if not r["ghost"])
     s = stats(found, "ghosty")
@@ -191,6 +208,144 @@ def test_ab_magnitudes_and_bins():
     np.testing.assert_allclose(mags, [31.4, 0, np.nan, np.nan], atol=1e-3)
     assert realism.bin_labels() == ["<21", "21-22", "22-23", "23-24", "24-25", ">=25"]
     assert realism.mag_bin([20.0, 21.0, 24.99, 25.0, 30.0, np.nan]).tolist() == [0, 1, 4, 5, 5, -1]
+
+
+def texture(seed, sigma_px=8, amp=0.6):
+    """Correlated sky texture (smoothed white noise) with bumps that reach the detection cut."""
+    tex = gaussian_filter(np.random.default_rng(seed).normal(0, 1, SHAPE), sigma_px)
+    return tex * amp / tex.std()
+
+
+def test_noise_control_reproduces_the_ghost_count_of_pure_sky_texture():
+    """SR = correlated texture and nothing else: every detection on it is a sky-noise bump, and
+    the control (the same texture phase-randomised and rank-matched) yields about as many;
+    white noise at the HST level yields none on either."""
+    founds = []
+    for seed in range(4):
+        hst = galaxies() + noise(seed)
+        srs = {"texture": texture(100 + seed), "white": noise(50 + seed)}
+        founds.append(measure(hst, srs, name=f"c{seed}"))
+    rows = [r for f in founds for r in f["pairs"]]
+    tex = [r for r in rows if r["model"] == "texture"]
+    ghosts = sum(r["n_ghost"] for r in tex)
+    control = sum(r["n_noise_control"] for r in tex)
+    assert ghosts > 30 and abs(ghosts - control) < 0.25 * ghosts
+    assert sum(r["n_bright_ghost"] for r in tex) <= 0.05 * ghosts
+    assert all(
+        r["n_ghost"] == 0 and r["n_noise_control"] == 0 for r in rows if r["model"] == "white"
+    )
+    (summary,) = realism.summarize(merge(*founds), ["texture"])
+    st = summary["stats"]
+    assert st["noise_ghosts_per_arcmin2"]["value"] == pytest.approx(
+        control / (4 * tex[0]["area_arcmin2"])
+    )
+    assert st["ghosts_per_arcmin2"]["value"] > 0
+    excess = st["ghost_excess_per_arcmin2"]
+    assert excess["ci_lo"] < 0 < excess["ci_hi"]  # no ghosts beyond the sky texture
+    assert abs(excess["value"]) < 0.3 * st["ghosts_per_arcmin2"]["value"]
+    assert summary["n_noise_control"] == control and summary["n_bright_ghost"] <= 0.05 * ghosts
+
+
+def test_the_control_image_keeps_the_sky_histogram_and_has_no_sources():
+    sky = np.ones(SHAPE, dtype=bool)
+    sky[250:350, 250:350] = False
+    image = texture(3) + gaussian(SHAPE, 300, 300, 5.0, 50.0)
+    control = realism.noise_control(image, sky, seed=1)
+    assert control.shape == SHAPE and control.max() <= image[sky].max()
+    np.testing.assert_allclose(
+        np.percentile(control, [5, 50, 95]), np.percentile(image[sky], [5, 50, 95]), atol=0.02
+    )
+    assert np.abs(control[250:350, 250:350]).max() < 10  # the source is gone
+    assert np.array_equal(control, realism.noise_control(image, sky, seed=1))
+    assert not np.array_equal(control, realism.noise_control(image, sky, seed=2))
+    assert not realism.noise_control(image, np.zeros(SHAPE, dtype=bool)).any()
+
+
+def test_a_bright_ghost_needs_a_high_peak_and_nothing_in_hst_within_half_an_arcsec():
+    hst = galaxies() + noise()
+    # a wide 1.8 nJy bump on a noise-free copy: 7.2 sky sigma, under the 10 sigma cut
+    faint = gaussian(SHAPE, 80, 520, 12.0, 1.8)
+    # a compact bright source 24 px (0.8") from the third galaxy's centre: outside the 0.2"
+    # margin of its segments (so a ghost), inside 0.5" of them (so not a bright one)
+    beside = gaussian(SHAPE, 480, 114, 2.5, 30.0)
+    far = gaussian(SHAPE, *GHOST)
+    found = measure(hst, {"faint": galaxies() + faint, "beside": hst + beside, "far": hst + far})
+    rows = {r["model"]: r for r in found["pairs"]}
+    assert (rows["faint"]["n_ghost"], rows["faint"]["n_bright_ghost"]) == (1, 0)
+    assert (rows["beside"]["n_ghost"], rows["beside"]["n_bright_ghost"]) == (1, 0)
+    assert (rows["far"]["n_ghost"], rows["far"]["n_bright_ghost"]) == (1, 1)
+    by_model = {r["model"]: r for r in found["sr"] if r["ghost"]}
+    assert by_model["faint"]["peak_njy"] == pytest.approx(1.8, rel=0.05)
+    assert by_model["beside"]["peak_njy"] > 25 and by_model["far"]["bright_ghost"] == 1
+    # the bright ghost is left out of the sky the control is made from, so a 20 nJy source in
+    # otherwise white sky gives no control detection
+    assert rows["far"]["n_noise_control"] == 0
+
+
+def test_a_bright_ghost_peak_is_measured_above_the_sr_sky_mean():
+    """Paper mode leaves the SR image unsubtracted (measure_pair gets it as predicted): a ghost
+    whose raw peak clears 10 HST sky sigma only because the SR sky sits 4 sigma above zero is
+    not bright; the same bump on a sky at zero is not either, a brighter one is."""
+    hst = np.clip(galaxies() + noise(), 0, None)  # paper mode's clipped HST: sky sigma 0.25
+    bump = gaussian(SHAPE, *GHOST[:3], 1.6)  # 6.4 sigma above the sky
+    srs = {"lifted": hst + 1.0 + bump, "bright": hst + gaussian(SHAPE, *GHOST)}
+    detected = catalogs.detect_hst(hst, THRESHOLD, catalogs.NPIXELS)
+    found = realism.measure_pair(
+        NAME, hst, srs, detected, THRESHOLD, catalogs.NPIXELS, catalogs.KERNEL_FWHM, HR_PIX
+    )
+    rows = {r["model"]: r for r in found["pairs"]}
+    ghosts = {r["model"]: r for r in found["sr"] if r["ghost"]}
+    sigma = rows["lifted"]["hst_sky_sigma_njy"]
+    assert sigma == pytest.approx(0.25, rel=0.15)
+    assert all(rows[m]["n_ghost"] == 1 for m in srs)
+    # the raw peak (peak_njy, as cataloged) of the lifted ghost clears the 10 sigma cut, its
+    # height above the SR sky (1.6 plus the noise under it) does not
+    assert 10 * sigma < ghosts["lifted"]["peak_njy"] < 10 * sigma + 1.0
+    assert rows["lifted"]["n_bright_ghost"] == 0 and ghosts["lifted"]["bright_ghost"] == 0
+    assert rows["bright"]["n_bright_ghost"] == 1 and ghosts["bright"]["bright_ghost"] == 1
+    # the lifted sky is still source-free texture to the noise control: its holes are filled at
+    # the sky level before the phase randomisation, so they add no structure of their own
+    assert rows["lifted"]["n_noise_control"] == 0
+
+
+def test_depth_bins_split_cutouts_at_the_sky_sigma_terciles():
+    found, groups = synthetic([0, 1, 2, 3, 4, 5], ["all"] * 6)
+    for i, row in enumerate(found["pairs"]):
+        row["hst_sky_sigma_njy"] = 0.1 * (i + 1)
+        row["n_noise_control"] = [0, 0, 1, 1, 2, 2][i]
+        row["n_bright_ghost"] = [0, 0, 0, 1, 1, 1][i]
+    depth, edges = realism.depth_bins([r["hst_sky_sigma_njy"] for r in found["pairs"]])
+    assert depth.tolist() == [0, 0, 1, 1, 2, 2] and len(edges) == 2
+    assert realism.depth_bins([np.nan, 0.3])[0].tolist() == [-1, 2]
+    assert realism.depth_bins([np.nan])[0].tolist() == [-1]
+    (s,) = realism.summarize(found, ["m"], groups)
+    st = s["stats"]
+    assert st["ghosts_per_arcmin2"]["value"] == pytest.approx(15 / 0.54)
+    assert st["noise_ghosts_per_arcmin2"]["value"] == pytest.approx(6 / 0.6)
+    assert st["ghost_excess_per_arcmin2"]["value"] == pytest.approx(15 / 0.54 - 10)
+    assert st["bright_ghosts_per_arcmin2"]["value"] == pytest.approx(3 / 0.54)
+    assert s["depth_n"] == [2, 2, 2] and s["depth_sigma"][0] == pytest.approx([0.1, 0.2])
+    assert st["ghosts_per_arcmin2_depth1"]["value"] == pytest.approx(1 / 0.18)
+    assert st["noise_ghosts_per_arcmin2_depth1"]["value"] == 0
+    assert st["ghosts_per_arcmin2_depth3"]["value"] == pytest.approx(9 / 0.18)
+    assert st["noise_ghosts_per_arcmin2_depth3"]["value"] == pytest.approx(4 / 0.2)
+    assert st["ghost_excess_per_arcmin2_depth3"]["value"] == pytest.approx(9 / 0.18 - 20)
+    assert st["bright_ghosts_per_arcmin2_depth3"]["value"] == pytest.approx(2 / 0.18)
+    assert st["ghosts_per_arcmin2_depth2"]["n"] == 2
+    # one group: no spread in any of the new intervals either
+    for name in ("ghost_excess_per_arcmin2", "bright_ghosts_per_arcmin2_depth3"):
+        assert (
+            st[name]["ci_lo"]
+            == pytest.approx(st[name]["value"])
+            == pytest.approx(st[name]["ci_hi"])
+        )
+    lines = realism.report_lines([s], 0.2, [6.0])
+    text = "\n".join(lines)
+    assert "| m | 1 (0.1-0.2, n=2) |" in text and "| m | 3 (0.5-0.6, n=2) |" in text
+    assert "Ghosts against a noise control" in text and "| m | 27.8" in text
+    # the sky sigma column is a cutout property: a second model with other counts shares the bins
+    (s2,) = realism.summarize(found, ["m"], groups)
+    assert s2["depth_n"] == s["depth_n"]
 
 
 def synthetic(n_ghost, groups):
@@ -313,7 +468,9 @@ def test_process_pair_detects_once_with_the_pairs_settings(monkeypatch, tmp_path
     assert [args[1:] for args, _ in calls["hst"]] == [detect]  # once, for Table 4 and realism
     loose = (*realism.relaxed(*detect[:2]), detect[2])
     used = [args[1:] for args, _ in calls["realism"]]
-    assert used[0] == loose and used.count(detect) == len(preds) and set(used) <= {detect, loose}
+    # the full cut twice per model: on the SR image and on its noise control
+    assert used[0] == loose and used.count(detect) == 2 * len(preds)
+    assert set(used) <= {detect, loose}
     # Table 4 from that one detection is what catalog_set gives detecting HST itself
     ((args, kwargs),) = calls["catalog_set"]
     assert kwargs.pop("detected") is not None
@@ -394,6 +551,18 @@ def test_compare_counts_ghosts_in_every_pair_and_keeps_table4(monkeypatch, tmp_p
     assert "| neo | " in report and "| ghosty | " in report and "2 cutouts" in report
     assert ("paper mode" in report) == paper_mode
     assert '0.2" (a disk of radius 6 HR px)' in report and "failed" not in report
+    assert "Ghosts against a noise control" in report and "Ghosts by HST depth" in report
+    assert "Gaia DR3 stars (neo/eval/stars.py): none in these cutouts." in report
+    for stat in (
+        "noise_ghosts_per_arcmin2",
+        "ghost_excess_per_arcmin2",
+        "bright_ghosts_per_arcmin2",
+    ):
+        assert (stat, "ghosty") in {(k[1], k[0]) for k in summary}
+        assert ("ghosty", f"{stat}_depth3") in summary
+    assert summary["ghosty", "bright_ghosts_per_arcmin2"] > 0
+    assert summary["ghosty", "noise_ghosts_per_arcmin2"] == 0
+    assert summary["ghosty", "ghost_excess_per_arcmin2"] == summary["ghosty", "ghosts_per_arcmin2"]
 
     # the realism check leaves every Table-4 output as it was
     plain = tmp_path / "plain"

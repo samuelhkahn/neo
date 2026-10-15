@@ -35,6 +35,22 @@ selection and the reported numbers never use the same pairs. With <split>/groups
 neo.preprocess.leakage) whole groups of overlapping cutouts are assigned together, so the two
 subsets share no sky; without it, pairs are assigned by name.
 
+Gaia stars moved between the HST epoch (COSMOS ACS, 2003-2005) and the LSST epoch (DP2 visits,
+2025-2026), by 0.2" in the median: in HST they sit where they were in 2004, in the LR input where
+they are now. By default every HST source whose centroid falls inside a Gaia DR3 star mask
+(neo.eval.stars: a disk of max(0.3", 1.5 x the star's motion) around both epoch positions, from
+the cutout's WCS and the shipped catalog) is flagged near_gaia_star in sources.csv and left out of
+the Table 4 statistics, gains and pairwise shares, and the realism files set such SR detections
+and HST sources aside the same way (near_star); table4.md says how many. --keep-stars counts them
+as before but still flags them (near_gaia_star, near_star), so the two runs differ only in which
+sources the statistics use; cutouts without a WCS, or outside the catalog box, are always unmasked.
+The catalog ships with the code (neo/data/gaia_dr3_cosmos_stars.csv): without it the run stops
+before any work, unless --keep-stars is given, in which case the stars are not checked and both
+reports say so. The realism check also records, per cutout and model, the detections on a
+phase-randomised noise control of the SR sky, the HST sky sigma and the bright ghosts, and
+realism.md reports ghosts as the excess over that control, bright ghosts, and both by HST depth
+(neo.eval.realism).
+
 --paper-mode reproduces the procedure behind the paper's Table 4 (its Create Catalogs and Table-4
 notebooks): HST and LR measured as clip(x, 0, p99.999) per cutout (the training dataset's
 clip), no background subtraction (SR as predicted); smoothing FWHM and minimum area matched on
@@ -61,7 +77,7 @@ from astropy.io import fits  # noqa: E402
 from astropy.wcs import WCS  # noqa: E402
 from astropy.wcs.utils import proj_plane_pixel_scales  # noqa: E402
 
-from neo.eval import metrics, realism  # noqa: E402
+from neo.eval import metrics, realism, stars  # noqa: E402
 from neo.eval.catalogs import (  # noqa: E402
     KERNEL_FWHM,
     NPIXELS,
@@ -132,7 +148,9 @@ def process_pair(job):
     detects each SR image on its own with the same settings. Realism is recorded for every pair,
     also those catalog_set drops (no HST source, or an LR source count unlike HST's). Its sky
     excess differences the images before default mode's background subtraction, which would
-    take out flux a model spreads over the SEP mesh.
+    take out flux a model spreads over the SEP mesh. With opts["stars"] (star_tracks keywords)
+    the cutout's Gaia star mask flags the HST catalog's sources (near_gaia_star column) and is
+    passed to realism, which sets them aside unless opts["keep_stars"].
     """
     name, split, preds, opts = job
     warnings.simplefilter("ignore")
@@ -140,6 +158,14 @@ def process_pair(job):
     hst_raw, hr_header = load_cutout(split / "hr" / name, HR_SIZE, paper)
     lr, lr_header = load_cutout(split / "lr" / name, LR_SIZE, paper)
     hst = hst_raw if paper else subtract_background(hst_raw)
+    star_mask, n_stars = None, None  # None: the cutout is not checked against the catalog
+    if opts.get("stars") is not None:
+        tracks = stars.star_tracks(hr_header, hst.shape, **opts["stars"])
+        if tracks.notice:
+            print(f"  {name}: {tracks.notice}")
+        n_stars = len(tracks)
+        if n_stars:
+            star_mask = tracks.mask()
     rng = np.random.default_rng(int(hashlib.md5(name.encode()).hexdigest(), 16) % 2**32)
     srs, srs_raw = {}, {}
     for model, directory in preds.items():
@@ -177,6 +203,9 @@ def process_pair(job):
                 opts["margin"],
                 hst_raw=hst_raw,
                 srs_raw=srs_raw,
+                star_mask=star_mask,
+                n_stars=n_stars,
+                set_aside=not opts.get("keep_stars", False),
             )
         except Exception as exc:  # noqa: BLE001
             found = {"error": failure(exc)}
@@ -184,6 +213,11 @@ def process_pair(job):
         result = None  # catalog_set gives None without HST sources
         if detected is not None:
             result = catalog_set(hst, srs, lr, factor=opts["factor"], detected=detected, **settings)
+        if result is not None and star_mask is not None:
+            hst_tbl = result[0]
+            hst_tbl["near_gaia_star"] = realism.in_mask(
+                star_mask, hst_tbl["xcentroid"], hst_tbl["ycentroid"]
+            )
     except Exception as exc:  # noqa: BLE001
         return name, None, failure(exc), settings, found
     return name, result, None, settings, found
@@ -206,6 +240,10 @@ def per_source_rows(name, hst_tbl, sr_tbls, lr_tbl, factor, paper_mode=False):
             "hst_kron_flux": float(hst_tbl["kron_flux"][i]),
             "hst_half_light_radius": float(hst_tbl["half_light_radius"][i]),
             "hst_ellipticity": float(hst_tbl["ellipticity"][i]),
+            # inside a Gaia star mask (process_pair); 0 when no mask was built for the cutout
+            "near_gaia_star": int(hst_tbl["near_gaia_star"][i])
+            if "near_gaia_star" in hst_tbl.colnames
+            else 0,
         }
         for k in sets:
             for p in metrics.PARAMETERS:
@@ -351,6 +389,7 @@ def track(
     paper_q,
     realism_summary=None,
     realism_failed=0,
+    n_star_sources=0,
 ):
     mode = "paper" if args.paper_mode else "default"
     experiment = start_experiment(
@@ -381,6 +420,8 @@ def track(
             "n_sets_kept": kept,
             "n_sources": len(rows),
             "n_sources_orientation": int(elongated.sum()),
+            "n_sources_near_gaia_stars": n_star_sources,
+            "keep_stars": args.keep_stars,
             "out": str(out.resolve()),
             **{f"pred_dir/{m}": str(d.resolve()) for m, d in preds.items()},
             **{f"checkpoint/{m}": c for m, c in checkpoints.items()},
@@ -431,7 +472,9 @@ def track(
     experiment.end()
 
 
-def realism_report(args, out, found, preds, groups, used, checkpoints, n_failed=0) -> list:
+def realism_report(
+    args, out, found, preds, groups, used, checkpoints, n_failed=0, stars_checked=True
+) -> list:
     """Write the realism files (module docstring) and print realism.md; returns the summary."""
     mode = "paper" if args.paper_mode else "default"
     intro = [
@@ -439,12 +482,62 @@ def realism_report(args, out, found, preds, groups, used, checkpoints, n_failed=
         "",
         *mode_lines(args, used),
         *prediction_lines(args, checkpoints),
+        *star_lines(args, stars_checked),
     ]
     summary, lines = realism.write_report(
         out, found, list(preds), groups, intro, args.realism_margin, n_failed
     )
     print("\n".join(lines))
     return summary
+
+
+def star_lines(args, checked=True) -> list[str]:
+    """A line for the reports on the Gaia star masks: how they were built from the options the
+    run used, and whether the sources inside them are set aside or counted; `checked` is False
+    when no masks were built (the catalog is missing and --keep-stars was given)."""
+    if not checked:
+        return [
+            "Gaia DR3 stars not checked: the catalog (neo/eval/stars.py) is missing, so no star "
+            "masks were built and every source is counted (--keep-stars)."
+        ]
+    masks = (
+        f'Gaia DR3 star masks (neo/eval/stars.py): a disk of max({args.star_radius:g}", '
+        f"{stars.MOTION_FACTOR:g} x the star's motion between epochs {args.hst_epoch:g} and "
+        f"{args.lsst_epoch:g}) around both epoch positions, from each cutout's WCS."
+    )
+    if args.keep_stars:
+        return [
+            masks + " Sources inside them are flagged (near_gaia_star in sources.csv, near_star "
+            "in the realism files) but counted like any other (--keep-stars), so stars moved "
+            "between the epochs read as ghosts, misses and offsets."
+        ]
+    return [
+        masks + " Sources inside them are flagged and set aside from Table 4 and the realism "
+        "counts (--keep-stars counts them)."
+    ]
+
+
+def star_options(args):
+    """neo.eval.stars.star_tracks keywords from the CLI (the masks are built and the sources
+    inside them flagged with or without --keep-stars, which only decides whether they count)."""
+    return {
+        "hst_epoch": args.hst_epoch,
+        "lsst_epoch": args.lsst_epoch,
+        "radius_arcsec": args.star_radius,
+    }
+
+
+def check_catalog(keep_stars: bool):
+    """Whether the Gaia catalog can be read, before any work is started: without it the run
+    stops with the remedy, unless --keep-stars, which then runs with no star masks at all."""
+    try:
+        stars.load_catalog()
+    except FileNotFoundError as exc:
+        if not keep_stars:
+            raise SystemExit(f"{exc} (or pass --keep-stars)") from None
+        print(f"{exc}: Gaia stars not checked (--keep-stars)")
+        return False
+    return True
 
 
 def column(rows, key, mask=None):
@@ -495,6 +588,24 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="SR sources further than this from every HST segment, at the full or the relaxed "
         f'cut, are ghosts (default {realism.MARGIN_ARCSEC:g}")',
     )
+    parser.add_argument(
+        "--keep-stars",
+        action="store_true",
+        help="count sources inside the Gaia DR3 star masks (default: set aside; module docstring)",
+    )
+    parser.add_argument(
+        "--star-radius",
+        type=float,
+        default=stars.MIN_RADIUS_ARCSEC,
+        metavar="ARCSEC",
+        help=f"minimum star mask radius (default {stars.MIN_RADIUS_ARCSEC:g})",
+    )
+    parser.add_argument(
+        "--hst-epoch", type=float, default=stars.HST_EPOCH, help=f"default {stars.HST_EPOCH}"
+    )
+    parser.add_argument(
+        "--lsst-epoch", type=float, default=stars.LSST_EPOCH, help=f"default {stars.LSST_EPOCH}"
+    )
     parser.add_argument("--tag", action="append", default=[], help="extra Comet tag (repeatable)")
     parser.add_argument("--no-comet", action="store_true", help="do not track the run on Comet")
     return parser.parse_args(argv)
@@ -519,6 +630,7 @@ def resolve_mode(args) -> None:
 def main(argv=None) -> None:
     args = parse_args(argv)
     resolve_mode(args)
+    stars_checked = check_catalog(args.keep_stars)
     split = Path(args.split_dir)
     preds = {}
     for item in args.pred:
@@ -550,6 +662,8 @@ def main(argv=None) -> None:
         "paper_mode": args.paper_mode,
         "realism": not args.no_realism,
         "margin": args.realism_margin,
+        "stars": star_options(args) if stars_checked else None,
+        "keep_stars": args.keep_stars,
     }
     mode = "paper" if args.paper_mode else "default"
     print(f"{len(names)} pairs ({args.subset}, {mode} mode) x models {list(preds)}")
@@ -586,7 +700,7 @@ def main(argv=None) -> None:
         print(f"\nWARNING: source realism failed on all {len(names)} pairs; no realism files")
     elif not args.no_realism:  # before the check below: a pure-sky subset still has a ghost rate
         realism_summary = realism_report(
-            args, out, found, preds, groups, used, checkpoints, len(realism_failed)
+            args, out, found, preds, groups, used, checkpoints, len(realism_failed), stars_checked
         )
     if not rows:
         raise SystemExit("no sources survived cataloging")
@@ -596,6 +710,15 @@ def main(argv=None) -> None:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    # sources.csv keeps every source; the statistics leave out those inside Gaia star masks
+    n_star_sources = sum(r["near_gaia_star"] for r in rows)
+    n_all = len(rows)
+    if not args.keep_stars:
+        rows = [r for r in rows if not r["near_gaia_star"]]
+        if not rows:
+            raise SystemExit(
+                f"no sources left: all {n_all} are inside Gaia star masks (--keep-stars keeps them)"
+            )
 
     sets = list(preds) + [LR_KEY]
     if args.paper_mode:
@@ -661,8 +784,10 @@ def main(argv=None) -> None:
                 )
     for fname, data in (("paper_q.csv", paper_q), ("gains.csv", gains), ("pairwise.csv", pairwise)):
         if data:
+            # every key any row has: a gain row without a finite source holds only "n"
+            fields = list(dict.fromkeys(key for row in data for key in row))
             with open(out / fname, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=list(data[0]))
+                writer = csv.DictWriter(f, fieldnames=fields)
                 writer.writeheader()
                 writer.writerows(data)
 
@@ -685,12 +810,25 @@ def main(argv=None) -> None:
             "Median [bootstrap 95% CI] (NMAD). Relative bias for R_e, FWHM, C75/25 and flux; "
             "absolute bias for q; S = 1 - |cos dtheta| for orientation (0 = perfect)."
         )
+    if not stars_checked:
+        star_note = "Gaia DR3 stars not checked (no catalog; --keep-stars)"
+    elif args.keep_stars:
+        star_note = (
+            f"{n_star_sources} inside Gaia DR3 star masks counted (--keep-stars; near_gaia_star "
+            "in sources.csv)"
+        )
+    else:
+        star_note = (
+            f"{n_star_sources} inside Gaia DR3 star masks excluded (neo/eval/stars.py; "
+            "--keep-stars counts them)"
+        )
     lines = [
         f"# Morphology comparison ({args.subset} subset, {mode} mode)",
         "",
         *mode_lines(args, used),
         *prediction_lines(args, checkpoints),
-        f"{kept} cutout sets, {len(rows)} HST-detected sources; {scored}.",
+        *star_lines(args, stars_checked),
+        f"{kept} cutout sets, {n_all} HST-detected sources, {star_note}; {scored}.",
         stat,
         "",
         header,
@@ -749,6 +887,7 @@ def main(argv=None) -> None:
             paper_q,
             realism_summary,
             len(realism_failed),
+            n_star_sources,
         )
     plt.close(fig)
     print(f"\nreport written to {out}")

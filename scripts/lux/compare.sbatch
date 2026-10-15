@@ -20,8 +20,15 @@
 # Besides Table 4 it writes the source-realism check (realism.md, realism*.csv): each SR image is
 # also detected on its own and its sources outside HST's segments (+0.2", HST looked at down to
 # half the threshold so faint real sources do not count) are ghosts, which Table 4 cannot see; it
-# adds little time (NO_REALISM=1 skips it). Single draws are noisier than stacks: judge
-# their ghost rate against a noise control (HST plus matched noise) as well.
+# adds little time (NO_REALISM=1 skips it). realism.md also gives ghosts as the excess over a
+# phase-randomised noise control of each SR sky (most ghosts at this threshold are sky-texture
+# bumps), the bright ghosts (peak > 10 HST sky sigma, nothing in HST within 0.5"), and both by
+# HST depth. Gaia DR3 stars moved between the HST and LSST epochs (median 0.2"): by default the
+# HST sources and SR detections inside their masks (neo/eval/stars.py, catalog shipped in
+# neo/data) are set aside from Table 4 and the realism counts; KEEP_STARS=1 counts them but still
+# flags them (near_gaia_star in sources.csv, near_star in the realism files) and writes to a
+# -stars directory. Without the catalog in the checkout the run stops at once (KEEP_STARS=1 then
+# runs with no star masks and says so in both reports).
 # PAPER_MODE=1 measures as the code behind the paper's Table 4 did (compare.py --paper-mode: clip
 # at 0 and p99.999, no background subtraction, kernel and minimum area matched on the sky, no
 # ellipticity cut, +/- = std); the output directory gets a -paper suffix.
@@ -45,8 +52,10 @@ PRED_ARGS=()
 for p in $PREDS; do
   PRED_ARGS+=(--pred "$p")
 done
+STAR_FLAG=""
+if [ "${KEEP_STARS:-0}" = 1 ]; then STAR_FLAG="--keep-stars"; SUFFIX="$SUFFIX-stars"; fi
 uv run python -m neo.eval.compare \
   --split-dir "$NEO_DATA/pairs/cosmos_web_i/$SPLIT" "${PRED_ARGS[@]}" ${PAPER_FLAG:+"$PAPER_FLAG"} \
   --subset "$SUBSET" --workers "${SLURM_CPUS_PER_TASK:-8}" \
   --out "$NEO_DATA/comparison/$SPLIT-$SUBSET$SUFFIX-${SLURM_JOB_ID:-local}" ${LIMIT:+--limit "$LIMIT"} \
-  ${NO_REALISM:+--no-realism}
+  ${NO_REALISM:+--no-realism} ${STAR_FLAG:+"$STAR_FLAG"}

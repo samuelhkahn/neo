@@ -269,7 +269,9 @@ def test_sweep_scores_a_noise_run_with_the_noisy_fake_for_the_discriminator(monk
     a = rows(tmp_path / "plain" / "sweep.csv")[0]
     b = rows(tmp_path / "noisy" / "sweep.csv")[0]
     for key in ("l1", "segmap_l1", "vgg", "k50"):  # the clean output is scored
-        assert float(a[key]) == pytest.approx(float(b[key]), rel=1e-6)
+        # k50 is NaN for both: the tiny generator blows up every HST source, which is counted
+        assert float(a[key]) == pytest.approx(float(b[key]), rel=1e-6, nan_ok=True)
+    assert a["fine_n_blown"] == b["fine_n_blown"] and int(a["fine_n_blown"]) > 0
     for key in ("adversarial", "discriminator"):  # judged with noise, as training does
         assert float(a[key]) != pytest.approx(float(b[key]), rel=1e-6)
     # the sweep never measures a template of its own: a run whose cache was not copied with its
