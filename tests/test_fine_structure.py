@@ -64,3 +64,22 @@ def test_empty_cutout_contributes_nothing():
     empty = np.random.default_rng(0).normal(0, 1, (600, 600))
     acc.add(fs.HstSources(empty, spectra), empty)
     assert acc.n_sources == 0
+
+
+def test_saturated_sources_are_counted_and_skipped(images):
+    """One source saturated at the generator's ceiling would dominate every pooled spectrum."""
+    truth, hst = images[0]
+    spectra = fs.Spectra()
+    srcs = fs.HstSources(hst, spectra)
+    x, y = srcs.positions[0]
+    blown = truth.copy()
+    blown[int(y) - 2 : int(y) + 3, int(x) - 2 : int(x) + 3] = 1e6
+    acc = fs.Accumulator(spectra)
+    acc.add(srcs, blown, saturation=1e5)
+    r = acc.result()
+    assert acc.n_saturated == 1 and r["n_sources"] == len(srcs.positions) - 1
+    assert r["saturated_fraction"] == pytest.approx(1 / len(srcs.positions))
+    assert r["T_band"] == pytest.approx(1.0, abs=0.1) and r["R_band"] < 1.5
+    unguarded = fs.Accumulator(spectra)
+    unguarded.add(srcs, blown)  # no threshold: the blown source wrecks the pooled power ratio
+    assert unguarded.result()["R_band"] > 100
