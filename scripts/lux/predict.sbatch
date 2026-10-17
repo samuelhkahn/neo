@@ -22,10 +22,12 @@
 # SAMPLES=K (K > 1; diffusion, or GEN_MODE=train) draws K samples per pair and writes the first
 # draw and the stacks of all K as single/, mean/, median/ (each a directory for compare.sbatch) and
 # std/ (per-pixel spread) under the output directory (neo/eval/stack.py); K times slower.
-# Output: $NEO_DATA/predictions/<MODEL>/<run>/<checkpoint>/<SPLIT>-<SUBSET>[-gentrain][-k<K>]
+# NOISE=hst (a model trained with [NOISE], neo/noise.py) adds an HST-like noise realisation to the
+# clean prediction (predict.py --noise hst; the default none writes the clean image).
+# Output: $NEO_DATA/predictions/<MODEL>/<run>/<checkpoint>/<SPLIT>-<SUBSET>[-gentrain][-k<K>][-noise]
 # (printed below), in nJy per HR pixel.
 # Knobs: CONFIG, MODEL, CKPT (required), SUBSET (select|report|all), SPLIT (default val), LIMIT, BATCH,
-# GEN_MODE (eval|train), SAMPLES (default 1).
+# GEN_MODE (eval|train), SAMPLES (default 1), NOISE (none|hst).
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 export PATH="$HOME/.local/bin:$PATH"
@@ -48,8 +50,14 @@ case "$GEN_MODE" in
 esac
 SAMPLES="${SAMPLES:-1}"
 if [ "$SAMPLES" -gt 1 ]; then SUFFIX="$SUFFIX-k$SAMPLES"; fi
+NOISE="${NOISE:-none}"
+case "$NOISE" in
+  none) ;;
+  hst) SUFFIX="$SUFFIX-noise" ;;
+  *) echo "NOISE must be none or hst, not $NOISE" >&2; exit 1 ;;
+esac
 OUT="$NEO_DATA/predictions/$MODEL/$(basename "$(dirname "$CKPT")")/$(basename "$CKPT" .pt)/$SPLIT-$SUBSET$SUFFIX"
-echo "predictions -> $OUT (generator mode $GEN_MODE, batch $BATCH, $SAMPLES draw(s) per pair)"
+echo "predictions -> $OUT (generator mode $GEN_MODE, batch $BATCH, $SAMPLES draw(s) per pair, noise $NOISE)"
 if [ "$SAMPLES" -gt 1 ]; then echo "  stacks: $OUT/{single,mean,median,std}"; fi
 
 nvidia-smi --query-gpu=name,memory.total --format=csv
@@ -57,4 +65,4 @@ uv run python -m neo.eval.predict \
   --config "$CONFIG" --checkpoint "$CKPT" \
   --split-dir "$NEO_DATA/pairs/cosmos_web_i/$SPLIT" \
   --subset "$SUBSET" --out "$OUT" --gen-mode "$GEN_MODE" \
-  --batch-size "$BATCH" --samples "$SAMPLES" ${LIMIT:+--limit "$LIMIT"}
+  --batch-size "$BATCH" --samples "$SAMPLES" --noise "$NOISE" ${LIMIT:+--limit "$LIMIT"}
