@@ -481,3 +481,30 @@ def test_second_seed_config_is_arm_a_with_only_names_and_length_changed():
         ("COMET_TAG", "comet_tag"),
         ("GAN_STEPS", "gan_steps"),
     }
+
+
+@pytest.mark.parametrize(
+    "new, base, changed",
+    [
+        # a second run of clean D: only the names differ
+        ("lux_neo_relu_cleand_seed2.ini", "lux_neo_relu_cleand.ini", set()),
+        # Arm B with the clean discriminator conditioning
+        ("lux_neo_lrtrunk_cleand.ini", "lux_neo_lrtrunk.ini", {("DATASET", "hsc_hr_8bit")}),
+    ],
+)
+def test_clean_d_follow_up_configs_change_only_their_names_and_knob(new, base, changed):
+    b, c = read_config(CONFIGS / base), read_config(CONFIGS / new)
+    identifier = "lux_cosmosweb_i_" + new.removeprefix("lux_").removesuffix(".ini")
+    assert c["IDENTIFIER"]["identifier"] == f'"{identifier}"'
+    assert c["CHECKPOINT"]["ckpt_dir"] == "${NEO_DATA}/checkpoints/" + identifier
+    arm = identifier.removeprefix("lux_cosmosweb_i_")
+    assert c["COMET_TAG"]["comet_tag"].strip('"').endswith(" " + arm)
+    assert c["DATASET"]["hsc_hr_8bit"] == "none"
+    differ = {
+        (s, k)
+        for s in b.keys() | c.keys()
+        for k in b.get(s, {}).keys() | c.get(s, {}).keys()
+        if b.get(s, {}).get(k) != c.get(s, {}).get(k)
+    }
+    names = {("IDENTIFIER", "identifier"), ("CHECKPOINT", "ckpt_dir"), ("COMET_TAG", "comet_tag")}
+    assert differ == names | changed
