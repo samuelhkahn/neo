@@ -411,6 +411,15 @@ wheels = [
 ]
 
 [[package]]
+name = "dill"
+version = "0.4.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/81/e1/56027a71e31b02ddc53c7d65b01e68edf64dea2932122fe7746a516f75d5/dill-0.4.1.tar.gz", hash = "sha256:423092df4182177d4d8ba8290c8a5b640c66ab35ec7da59ccfa00f6fa3eea5fa", size = 187315, upload-time = "2026-01-19T02:36:56.85Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1e/77/dc8c558f7593132cf8fefec57c4f60c83b16941c574ac5f619abb3ae7933/dill-0.4.1-py3-none-any.whl", hash = "sha256:1e1ce33e978ae97fcfcff5638477032b801c46c7c65cf717f95fbc2248f79a9d", size = 120019, upload-time = "2026-01-19T02:36:55.663Z" },
+]
+
+[[package]]
 name = "donfig"
 version = "0.8.1.post1"
 source = { registry = "https://pypi.org/simple" }
@@ -945,6 +954,22 @@ wheels = [
 ]
 
 [[package]]
+name = "morpheus-core"
+version = "0.1.13"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "astropy" },
+    { name = "dill" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a0/4a/e408ac4450637217f4b4265ed237c7c765606b820fcfb5a009211adbe41c/morpheus-core-0.1.13.tar.gz", hash = "sha256:dcf77c2e9e8db684226ca55a15664137ecac30d7ee28fec4c13eb16c9cf4502d", size = 22350, upload-time = "2022-09-06T15:56:14.018Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/35/a5/b29e83b3a00f9bc0dcf806536b081070d92b91d9e04451ac63e81116caa5/morpheus_core-0.1.13-py3-none-any.whl", hash = "sha256:4d20bb2d8b6501f3b0397f6683ba0672751603b53b062d0668ecc73366fd1c5c", size = 24379, upload-time = "2022-09-06T15:56:12.139Z" },
+]
+
+[[package]]
 name = "mpmath"
 version = "1.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -975,6 +1000,7 @@ dependencies = [
 
 [package.optional-dependencies]
 eval = [
+    { name = "morpheus-core" },
     { name = "photutils" },
     { name = "sep" },
 ]
@@ -1009,6 +1035,7 @@ requires-dist = [
     { name = "astropy", specifier = ">=6.0" },
     { name = "comet-ml", marker = "extra == 'train'", specifier = ">=3.31" },
     { name = "matplotlib", marker = "extra == 'train'", specifier = ">=3.5" },
+    { name = "morpheus-core", marker = "extra == 'eval'", specifier = "==0.1.13" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "opencv-python", marker = "extra == 'train'", specifier = ">=4.5" },
     { name = "photutils", marker = "extra == 'eval'", specifier = ">=2.0,<4" },

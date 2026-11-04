@@ -31,6 +31,8 @@ train = [
     "tqdm>=4.62",
 ]
 eval = [
+    # the NEO paper's mosaicking (neo/eval/mosaic.py); pure Python, pinned to the paper's version
+    "morpheus-core==0.1.13",
     "photutils>=2.0,<4",
     "sep>=1.2",
 ]
