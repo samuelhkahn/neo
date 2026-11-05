@@ -20,6 +20,12 @@ Three steps, each a subcommand:
             inverse log scale). --tta rot4 runs every window four times, rotated by 0/90/180/270
             degrees, rotates each output back (exact: a 6 x 6 HR block stays on its LR pixel) and
             hands morpheus the per-pixel median (or mean) of the four in linear flux.
+            --negative-noise paper (the default) then restores the sky noise that training's clip
+            at zero removed, as the paper did in its Crop-InvScale step (Sec. 3; its notebook's
+            add_negative_noise): in each window, pixels exactly 0 (the generator's tanh saturated
+            at -1) become minus a random draw from the window's positive pixels outside sources
+            (photutils segmentation above mean + 3 std, 5 px). This happens per window, before
+            morpheus averages the overlapping windows.
   finalize  (run at the end of sr; rerun on its own if needed) turns morpheus's output.fits/n.fits
             into nJy images with the HR WCS: sr_mean (the mosaic), sr_std (spread of the window
             predictions), sr_n (windows per pixel) and sr_paper (the paper's display image: where
@@ -53,6 +59,7 @@ PAD = 14  # reflection pad 100 -> 128 (neo.data.dataset square_pad_lr)
 PATCH_BORDER = 150  # DP2 deep_coadd patches: 3300 px outer, 3000 px inner, 150 px border
 TTA_CHOICES = ("none", "rot4")
 REDUCE_CHOICES = ("median", "mean")
+NEGATIVE_NOISE_CHOICES = ("paper", "none")
 PRODUCTS = ("sr_mean", "sr_std", "sr_n", "sr_paper", "sr_flag")
 # everything a run writes into its output directory
 MOSAIC_FILES = ("output.fits", "n.fits", "mosaic.json", "preview.png") + tuple(
@@ -194,13 +201,46 @@ def window_to_input(window: np.ndarray):
     return transforms.ToTensor()(pad(scaled)).unsqueeze(0)  # (1, 1, 128, 128)
 
 
-def make_window_model(generate, tta: str = "none", reduce: str = "median", batch: int = 1):
+def add_negative_noise(window: np.ndarray, rng) -> int:
+    """The paper's add_negative_noise, in place on one HR window in linear units: every pixel
+    exactly 0 becomes -|draw|, the draws taken from the window's positive pixels outside sources
+    (photutils detect_sources above mean + 3 std with 5 connected px; as the paper, a 5e-5
+    threshold when that finds nothing). Returns the number of pixels filled."""
+    from photutils.segmentation import detect_sources
+
+    zeros = window == 0
+    n_zero = int(zeros.sum())
+    if not n_zero:
+        return 0
+    sources = np.zeros(window.shape, dtype=bool)
+    for threshold in (window.mean() + 3 * window.std(), 5e-5):
+        segm = detect_sources(window, threshold, 5)
+        if segm is not None:
+            sources = segm.data > 0
+            break
+    pool = window[~sources & (window > 0)]
+    if pool.size == 0:  # nothing positive outside sources: leave the zeros
+        return 0
+    window[zeros] = -np.abs(rng.choice(pool, size=n_zero))
+    return n_zero
+
+
+def make_window_model(
+    generate,
+    tta: str = "none",
+    reduce: str = "median",
+    batch: int = 1,
+    negative_noise: str = "none",
+    seed: int = 0,
+):
     """The callable morpheus-core calls: (B, 100, 100, 1) LR windows -> (B, 600, 600, 1) HR
     windows in the HR pair units.
 
     `generate` maps a (b, 1, 128, 128) tensor to the (b, 1, 768, 768) log-space output. Windows
     (and, with rot4, each rotation) are run `batch` at a time; batch 1 keeps train-mode batch
-    norm on each window's own statistics, as the paper did.
+    norm on each window's own statistics, as the paper did. negative_noise="paper" applies
+    add_negative_noise to each window's final (reduced) prediction; the returned callable's
+    `stats` dict counts the windows and the pixels it filled.
     """
     import torch
 
@@ -210,7 +250,11 @@ def make_window_model(generate, tta: str = "none", reduce: str = "median", batch
         raise ValueError(f"tta must be one of {TTA_CHOICES}")
     if reduce not in REDUCE_CHOICES:
         raise ValueError(f"reduce must be one of {REDUCE_CHOICES}")
+    if negative_noise not in NEGATIVE_NOISE_CHOICES:
+        raise ValueError(f"negative_noise must be one of {NEGATIVE_NOISE_CHOICES}")
     turns = (0, 1, 2, 3) if tta == "rot4" else (0,)
+    rng = np.random.default_rng(seed)
+    stats = {"windows": 0, "windows_with_zeros": 0, "zero_pixels": 0, "max_zero_frac": 0.0}
 
     def run(inputs):
         outs = []
@@ -233,13 +277,22 @@ def make_window_model(generate, tta: str = "none", reduce: str = "median", batch
             ]
             physical = to_physical(np.stack(per_turn))  # (turns, 600, 600), linear HR units
             if len(turns) == 1:
-                hr.append(physical[0])
+                window = physical[0]
             elif reduce == "median":
-                hr.append(np.median(physical, axis=0))
+                window = np.median(physical, axis=0)
             else:
-                hr.append(np.mean(physical, axis=0))
+                window = np.mean(physical, axis=0)
+            stats["windows"] += 1
+            if negative_noise == "paper":
+                filled = add_negative_noise(window, rng)
+                if filled:
+                    stats["windows_with_zeros"] += 1
+                    stats["zero_pixels"] += filled
+                    stats["max_zero_frac"] = max(stats["max_zero_frac"], filled / window.size)
+            hr.append(window)
         return np.stack(hr).astype(np.float32)[..., np.newaxis]
 
+    model.stats = stats
     return model
 
 
@@ -464,14 +517,19 @@ def cmd_sr(args) -> None:
     device = pick_device(args.device)
     predict = build_predictor(config, args.checkpoint, device, mode=args.gen_mode)
     model = make_window_model(
-        lambda x: predict(x, None), tta=args.tta, reduce=args.reduce, batch=args.gen_batch
+        lambda x: predict(x, None),
+        tta=args.tta,
+        reduce=args.reduce,
+        batch=args.gen_batch,
+        negative_noise=args.negative_noise,
+        seed=args.seed,
     )
     n_windows = ((lr.shape[0] - WINDOW) // STRIDE + 1) * ((lr.shape[1] - WINDOW) // STRIDE + 1)
     passes = 4 if args.tta == "rot4" else 1
     print(
         f"device {device} | LR {lr.shape} -> HR {(lr.shape[0] * FACTOR, lr.shape[1] * FACTOR)} | "
         f"{n_windows} windows x {passes} pass(es) | tta {args.tta} ({args.reduce}) | "
-        f"gen mode {args.gen_mode}",
+        f"gen mode {args.gen_mode} | negative noise {args.negative_noise}",
         flush=True,
     )
     meta = {
@@ -480,6 +538,7 @@ def cmd_sr(args) -> None:
         "lr": str(args.lr),
         "tta": args.tta,
         "reduce": args.reduce,
+        "negative_noise": args.negative_noise,
         "gen_mode": args.gen_mode,
         "gen_batch": args.gen_batch,
         "seed": args.seed,
@@ -517,11 +576,18 @@ def cmd_sr(args) -> None:
         if hdul is not None:
             hdul.close()
     meta["predict_seconds"] = round(time.time() - start, 1)
+    zero_stats = dict(model.stats)
+    zero_stats["zero_frac"] = zero_stats["zero_pixels"] / max(
+        zero_stats["windows"] * (WINDOW * FACTOR) ** 2, 1
+    )
+    meta["negative_noise_stats"] = zero_stats
+    print(f"negative noise: {zero_stats}", flush=True)
     cards = {
         "NEOCKPT": Path(args.checkpoint).name[:68],
         "NEORUN": Path(args.checkpoint).parent.name[:68],
         "NEOTTA": args.tta,
         "NEOREDUC": args.reduce,
+        "NEONEG": args.negative_noise,
         "NEOGMODE": args.gen_mode,
         "MSTRIDE": STRIDE,
         "MWINDOW": WINDOW,
@@ -530,7 +596,11 @@ def cmd_sr(args) -> None:
     meta["preview"] = str(preview(out, args.lr))
     (out / "mosaic.json").write_text(json.dumps(meta, indent=1))
     if experiment is not None:
-        experiment.log_metrics(meta["finalize"] | {"predict_seconds": meta["predict_seconds"]})
+        experiment.log_metrics(
+            meta["finalize"]
+            | {"predict_seconds": meta["predict_seconds"]}
+            | {f"negnoise_{k}": v for k, v in zero_stats.items()}
+        )
         experiment.log_image(meta["preview"], name="preview")
         experiment.log_asset(str(out / "mosaic.json"))
         experiment.end()
@@ -566,6 +636,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--out", required=True, help="output directory for this mosaic")
     p.add_argument("--tta", choices=TTA_CHOICES, default="none", help="rot4: 4 rotations/window")
     p.add_argument("--reduce", choices=REDUCE_CHOICES, default="median", help="rot4 combination")
+    p.add_argument(
+        "--negative-noise",
+        choices=NEGATIVE_NOISE_CHOICES,
+        default="paper",
+        help="paper: refill each window's exact zeros with negated sky noise (paper Sec. 3)",
+    )
     p.add_argument("--gen-mode", choices=["eval", "train"], default="train")
     p.add_argument("--gen-batch", type=int, default=1, help="windows per generator call")
     p.add_argument("--batch-size", type=int, default=16, help="windows per morpheus batch")

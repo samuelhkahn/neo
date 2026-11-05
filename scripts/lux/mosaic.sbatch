@@ -23,8 +23,8 @@
 # 24' box is 7200 x 7200 LR px = 126,736 windows: roughly 1-2 h single, 3-4 h rot4.
 # Output: $NEO_DATA/mosaics/<FIELD>/lr_ra<RA>_dec<DEC>_<SIZE>arcmin_<key>.fits (the LR image,
 #   built once per box and patch set, <key> a hash of the patch file names and sizes, shared by
-#   every run) and $NEO_DATA/mosaics/<FIELD>/<run>/<checkpoint>/<tta>[_<reduce>][_gen<mode>]
-#   [_seed<seed>]/ (suffixes only for non-default settings) holding
+#   every run) and $NEO_DATA/mosaics/<FIELD>/<run>/<checkpoint>/<tta>[_<reduce>][_negnoise]
+#   [_gen<mode>][_seed<seed>]/ (suffixes only for non-default settings, plus _negnoise) holding
 #   {sr_mean,sr_std,sr_n,sr_paper,sr_flag}.fits (nJy per 0.0333" px; sr_flag 2 = bad LR pixel,
 #   NaN in the SR images, 1 = a window over it held a bad LR pixel) + output.fits/n.fits
 #   (morpheus's raw arrays) + mosaic.json + preview.png.
@@ -35,7 +35,8 @@
 #   PATCHES (glob of deep_coadd files), TTA (none|rot4|both), REDUCE (median|mean), GEN_MODE
 #   (train|eval; train = the paper's per-window batch norm), SEED, OVERWRITE=1 (redo a mosaic),
 #   MAX_BADFRAC (0.02: refuse an LR box with more bad/uncovered pixels than this), REBUILD_LR=1
-#   (rebuild the LR image even if one exists for this box and patch set).
+#   (rebuild the LR image even if one exists for this box and patch set), NEG_NOISE (paper: refill
+#   each window's exact zeros with negated sky noise, as the paper did; none: leave them).
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 export PATH="$HOME/.local/bin:$PATH"
@@ -56,6 +57,7 @@ REDUCE="${REDUCE:-median}"
 GEN_MODE="${GEN_MODE:-train}"
 SEED="${SEED:-0}"
 MAX_BADFRAC="${MAX_BADFRAC:-0.02}"
+NEG_NOISE="${NEG_NOISE:-paper}"
 OVERWRITE_FLAG=()
 [ "${OVERWRITE:-0}" = 1 ] && OVERWRITE_FLAG=(--overwrite)
 case "$TTA" in
@@ -76,7 +78,10 @@ echo "$(wc -l <<<"$PATCH_FILES") patches, key $PATCH_KEY"
 LR="$BASE/lr_ra${RA}_dec${DEC}_${SIZE_ARCMIN}arcmin_${PATCH_KEY}.fits"
 OUT_BASE="$BASE/$(basename "$(dirname "$CKPT")")/$(basename "$CKPT" .pt)"
 # non-default settings get their own directories, so no run overwrites another's products
+# _negnoise marks mosaics with the paper's negative-noise refill; runs before it existed (none, rot4)
+# keep their directories
 SUFFIX=""
+[ "$NEG_NOISE" = paper ] && SUFFIX="_negnoise"
 [ "$GEN_MODE" = train ] || SUFFIX="${SUFFIX}_gen${GEN_MODE}"
 [ "$SEED" = 0 ] || SUFFIX="${SUFFIX}_seed${SEED}"
 run_dir() {  # $1 = tta
@@ -113,7 +118,8 @@ mosaic() {  # $1 = tta, $2 = GPU index
   CUDA_VISIBLE_DEVICES="$2" uv run --no-sync python -m neo.eval.mosaic sr \
     --config "$CONFIG" --checkpoint "$CKPT" --lr "$LR" --out "$(run_dir "$1")" \
     --tta "$1" --reduce "$REDUCE" --gen-mode "$GEN_MODE" --seed "$SEED" \
-    --max-badfrac "$MAX_BADFRAC" --tag "$FIELD" ${OVERWRITE_FLAG[@]+"${OVERWRITE_FLAG[@]}"} >"$log" 2>&1
+    --max-badfrac "$MAX_BADFRAC" --negative-noise "$NEG_NOISE" --tag "$FIELD" \
+    ${OVERWRITE_FLAG[@]+"${OVERWRITE_FLAG[@]}"} >"$log" 2>&1
 }
 
 status=0

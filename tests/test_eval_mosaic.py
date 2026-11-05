@@ -394,3 +394,66 @@ def test_sr_refusal_and_overwrite_guard_touch_nothing(tmp_path):
     with pytest.raises(SystemExit, match="--overwrite"):
         mosaic.main([*base, "--max-badfrac", "0.5"])
     assert all((out / name).read_bytes() == b"old" for name in ("sr_mean.fits", "mosaic.json"))
+
+
+def sky_window(seed=0):
+    """A 600 x 600 HR window like the generator's: half-normal sky (training clips at 0, so about
+    half the sky is exactly 0) plus one bright source."""
+    rng = np.random.default_rng(seed)
+    window = np.clip(rng.normal(0, 0.05, (600, 600)), 0, None)
+    yy, xx = np.mgrid[:600, :600]
+    r2 = (yy - 300) ** 2 + (xx - 200) ** 2
+    window += np.where(r2 < 40**2, 50 * np.exp(-r2 / (2 * 8**2)), 0)  # no float wings over the sky
+    return window
+
+
+def test_add_negative_noise_refills_only_zeros_from_sky():
+    window = sky_window()
+    before = window.copy()
+    zeros = before == 0
+    filled = mosaic.add_negative_noise(window, np.random.default_rng(0))
+    assert filled == zeros.sum() > 0
+    np.testing.assert_array_equal(window[~zeros], before[~zeros])  # nothing else moves
+    assert np.all(window[zeros] < 0)
+    # every draw is minus a positive pixel of the window below the detection threshold
+    threshold = before.mean() + 3 * before.std()
+    pool = before[(before > 0) & (before < threshold)]
+    assert np.isin(-window[zeros], pool).all()
+    # the sky becomes roughly symmetric about zero
+    sky = window[np.hypot(*np.mgrid[:600, :600] - np.array([300, 200])[:, None, None]) > 60]
+    assert abs(np.mean(sky)) < 0.1 * np.std(sky)
+
+
+def test_add_negative_noise_edge_cases():
+    rng = np.random.default_rng(0)
+    positive = np.full((600, 600), 0.1)
+    assert mosaic.add_negative_noise(positive.copy(), rng) == 0  # no zeros: untouched
+    empty = np.zeros((600, 600))
+    assert mosaic.add_negative_noise(empty, rng) == 0  # no sky to draw from: left at zero
+    assert np.all(empty == 0)
+
+
+def test_window_model_negative_noise_fills_saturated_sky():
+    from neo.data.dataset import SR_HST_HSC_Dataset
+
+    sky = sky_window(seed=1)  # linear HR units, about half exactly 0
+    log_sky = SR_HST_HSC_Dataset.ds9_scaling(np.pad(sky, 84, mode="reflect"), offset=1)
+    target = torch.tensor(log_sky, dtype=torch.float32)[None, None]
+
+    def generator(x):  # always predicts this window (zeros become log-space -1 exactly)
+        return target.expand(x.shape[0], 1, 768, 768)
+
+    lr = tied_lr((2, 100, 100))
+    plain = mosaic.make_window_model(generator)([lr[..., None]])[..., 0]
+    model = mosaic.make_window_model(generator, negative_noise="paper", seed=3)
+    noisy = model([lr[..., None]])[..., 0]
+    zeros = plain == 0
+    assert zeros[0].mean() > 0.4
+    assert np.all(noisy[zeros] < 0) and np.all(noisy[~zeros] == plain[~zeros])
+    assert model.stats["windows"] == 2 and model.stats["windows_with_zeros"] == 2
+    assert model.stats["zero_pixels"] == zeros.sum()
+    assert not np.array_equal(noisy[0], noisy[1])  # fresh draws per window
+    again = mosaic.make_window_model(generator, negative_noise="paper", seed=3)
+    np.testing.assert_array_equal(again([lr[..., None]])[..., 0], noisy)  # seeded
+    with pytest.raises(ValueError):
+        mosaic.make_window_model(generator, negative_noise="bogus")
