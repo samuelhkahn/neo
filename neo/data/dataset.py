@@ -102,11 +102,17 @@ class SR_HST_HSC_Dataset(Dataset):
             - "paired_image_translation": DS9 scaling for both HST and HSC
         data_aug: Whether to apply random flip augmentations.
         experiment: Comet ML Experiment instance for logging.
+        hr_floor, lr_floor: ds9_scale only: fixed lower clip of the HST and LR cutouts in stored
+            units (<= 0; neo/data/floors.py). 0, the default, is the paper's clip at zero.
     """
 
     def __init__(self, hst_path, hsc_path, hr_size, lr_size, transform_type,
-                 data_aug, experiment):
+                 data_aug, experiment, hr_floor=0.0, lr_floor=0.0):
         super().__init__()
+        if not (hr_floor <= 0 and lr_floor <= 0):
+            raise ValueError(f"floors must be <= 0, not hr {hr_floor}, lr {lr_floor}")
+        self.hr_floor = float(hr_floor)
+        self.lr_floor = float(lr_floor)
 
         if hr_size is not None and lr_size is not None:
             assert hr_size[0] == 6 * lr_size[0]
@@ -249,6 +255,18 @@ class SR_HST_HSC_Dataset(Dataset):
         clipped_array = np.clip(arr, min_offset, np.percentile(arr, 99.999))
         return clipped_array, min_offset
 
+    @classmethod
+    def floor_scaling(cls, arr, floor=0.0):
+        """clip then ds9 scale, as ds9_scale does: floor 0 is the paper's clip(arr, 0, p99.999)
+        (bit for bit); a floor < 0 clips to [floor, p99.999] and applies the signed ds9 scale
+        that maps the floor to -1 (neo/data/floors.py)."""
+        if floor == 0:
+            return cls.ds9_scaling(cls.clip(arr, use_data=False)[0], offset=1)
+        from neo.data.floors import scale
+
+        clipped = np.clip(arr, floor, max(np.percentile(arr, 99.999), floor))
+        return scale(clipped, floor).astype(np.float32)
+
     def __len__(self):
         return len(self.filenames)
 
@@ -321,10 +339,8 @@ class SR_HST_HSC_Dataset(Dataset):
             hsc_hr_clipped = self.clip(hsc_array, use_data=False)[0]
             hsc_transformation = self.ds9_scaling(hsc_hr_clipped, offset=1)
         elif self.transform_type == "ds9_scale":
-            hst_clipped = self.clip(hst_array, use_data=False)[0]
-            hst_transformation = self.ds9_scaling(hst_clipped, offset=1)
-            hsc_clipped = self.clip(hsc_array, use_data=False)[0]
-            hsc_transformation = self.ds9_scaling(hsc_clipped, offset=1)
+            hst_transformation = self.floor_scaling(hst_array, self.hr_floor)
+            hsc_transformation = self.floor_scaling(hsc_array, self.lr_floor)
             hsc_hr = self.hr_transforms(hsc_transformation.astype(np.float32))
 
         # Pad and convert to tensors

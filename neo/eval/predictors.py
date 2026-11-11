@@ -13,6 +13,7 @@ visual and realism comparisons with the noisy targets).
 
 import torch
 
+from neo.data import floors
 from neo.models.registry import check_generator, generator_name, make_generator
 from neo.noise import NoiseModel
 
@@ -25,6 +26,7 @@ def noise_model(config, noise, device):
         raise ValueError(f"noise must be one of {NOISE_OPTIONS}, not {noise!r}")
     if noise == "none":
         return None
+    floors.unsupported_with(floors.floors(config), config)
     if not config.has_section("NOISE"):
         raise ValueError(
             "--noise hst needs a config with a [NOISE] section (its template and sigma)"
@@ -37,6 +39,7 @@ def gan_predictor(config, checkpoint, device, mode: str = "eval", noise: str = "
     gen = make_generator(config)
     state = torch.load(checkpoint, map_location="cpu", weights_only=True)
     check_generator(state, config, checkpoint)  # neo / neo_relu weights would load either way
+    floors.check(state, config, checkpoint)  # its sky floors are the config's (neo/data/floors.py)
     gen.load_state_dict(state["gen"])
     gen.to(device)
     gen.train(mode == "train")

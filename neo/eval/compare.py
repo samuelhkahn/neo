@@ -331,6 +331,20 @@ def bias_figure(table4, title):
     return fig
 
 
+def floored_models(preds: dict, names: list) -> dict:
+    """{model: (hr_floor, lr_floor)} of the models predicted with [DATASET] sky floors
+    (predict.py NEOHRFL / NEOLRFL; absent = the paper's clip at 0, neo/data/floors.py)."""
+    found = {}
+    for model, directory in preds.items():
+        for name in names:
+            header = fits.getheader(directory / name)
+            pair = (float(header.get("NEOHRFL", 0.0)), float(header.get("NEOLRFL", 0.0)))
+            if pair != (0.0, 0.0):
+                found[model] = pair
+                break
+    return found
+
+
 def verify_predictions(split: Path, preds: dict, names: list) -> dict:
     """Each prediction must show its HR cutout's sky, and each directory hold one checkpoint.
 
@@ -649,6 +663,13 @@ def main(argv=None) -> None:
     if not names:
         raise SystemExit("no pairs predicted by every model in this subset")
     checkpoints = verify_predictions(split, preds, names)
+    floored = floored_models(preds, names) if args.paper_mode else {}
+    if floored:
+        raise SystemExit(
+            "--paper-mode clips HST and LR at 0 and refills SR zeros, as the paper's models were "
+            f"trained; {sorted(floored)} were trained with sky floors {floored} "
+            "(neo/data/floors.py) and keep their negative sky: score them in the default mode"
+        )
     for model, checkpoint in checkpoints.items():
         print(f"  {model}: {checkpoint}")
     for line in prediction_lines(args, checkpoints)[1:]:

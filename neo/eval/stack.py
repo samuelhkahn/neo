@@ -38,8 +38,21 @@ def to_log(v: torch.Tensor) -> torch.Tensor:
     return log - LOG_SCALE_OFFSET
 
 
-def stack(draws: torch.Tensor) -> dict:
-    """K draws (K, ...) in log space -> {single, mean, median (log space), std (linear)}."""
+def stack(draws: torch.Tensor, floor: float = 0.0) -> dict:
+    """K draws (K, ...) in log space -> {single, mean, median (log space), std (linear)}.
+
+    floor: the run's [DATASET] hr_floor; a floored run's log space is the signed ds9 scale
+    (neo/data/floors.py), so the linear means are taken through its own maps."""
+    if floor:
+        from neo.data import floors
+
+        def to_linear(x):
+            return floors.unscale(x.double(), floor)
+
+        def to_log(v):
+            return floors.scale(v.double(), floor)
+    else:
+        to_linear, to_log = _to_linear, _to_log
     k = draws.shape[0]
     linear = to_linear(draws)
     ordered = draws.sort(dim=0).values
@@ -138,3 +151,6 @@ def convergence_figure(name, hr, single, stacks):
     fig.colorbar(im, ax=axes, shrink=0.8, label="log-space difference")
     fig.suptitle(f"{name}: stacks of more draws")
     return fig
+
+
+_to_linear, _to_log = to_linear, to_log  # the paper's maps, for stack() with a floor of 0

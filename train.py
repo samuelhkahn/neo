@@ -25,6 +25,7 @@ from tqdm import tqdm
 
 from neo import checkpoint
 from neo.consistency import ConsistencyLoss
+from neo.data import floors
 from neo.data.augment import dataset_classes, hsc_hr_8bit_mode
 from neo.data.collate_fn import collate_fn
 from neo.log_figure import log_figure
@@ -33,7 +34,7 @@ from neo.noise import NoiseModel
 from neo.pix2pix import Pix2Pix
 
 
-def save_checkpoint(path, pix2pix, step, model_name):
+def save_checkpoint(path, pix2pix, step, model_name, sky_floors=None):
     """Write model + optimizer state crash-safely (neo/checkpoint.py): never a truncated file."""
     state = {
         "step": step,
@@ -41,6 +42,9 @@ def save_checkpoint(path, pix2pix, step, model_name):
         # the [MODEL] generator (set by main): neo and neo_relu checkpoints have the same keys, so
         # only this tells them apart (neo/models/registry.py check_generator)
         "generator": pix2pix.generator_name,
+        # [DATASET] hr_floor / lr_floor: the clip the model's log space is anchored to
+        # (neo/data/floors.py); evaluation refuses a config with other floors
+        **(sky_floors or {}),
         "gen": pix2pix.gen.state_dict(),
         "patch_gan": pix2pix.patch_gan.state_dict(),
         "gen_opt": pix2pix.gen_opt.state_dict(),
@@ -175,11 +179,16 @@ def main():
     augment, TrainDataset, ValDataset = dataset_classes(config)
     experiment.log_parameter("augment", augment)
     experiment.log_parameter("hsc_hr_8bit", hsc_hr_8bit_mode(config))
+    # [DATASET] hr_floor / lr_floor: the clip's lower bound (neo/data/floors.py; 0 = the paper's)
+    sky_floors = floors.floors(config)
+    floors.unsupported_with(sky_floors, config)
+    experiment.log_parameters(sky_floors)
+    print(f"sky floors (stored units): {sky_floors}")
     dataloader_train = torch.utils.data.DataLoader(
         TrainDataset(
             hst_path=hst_path_train, hsc_path=hsc_path_train,
             hr_size=[hst_dim, hst_dim], lr_size=[hsc_dim, hsc_dim],
-            transform_type="ds9_scale", data_aug=data_aug, experiment=None,
+            transform_type="ds9_scale", data_aug=data_aug, experiment=None, **sky_floors,
         ),
         batch_size=batch_size, shuffle=True, collate_fn=collate_fn,
         num_workers=num_workers, persistent_workers=num_workers > 0,
@@ -190,7 +199,7 @@ def main():
         ValDataset(
             hst_path=hst_path_val, hsc_path=hsc_path_val,
             hr_size=[hst_dim, hst_dim], lr_size=[hsc_dim, hsc_dim],
-            transform_type="ds9_scale", data_aug=data_aug, experiment=None,
+            transform_type="ds9_scale", data_aug=data_aug, experiment=None, **sky_floors,
         ),
         batch_size=batch_size, shuffle=True, collate_fn=collate_fn,
         num_workers=num_workers, persistent_workers=num_workers > 0,
@@ -252,6 +261,7 @@ def main():
         from neo.models.registry import check_generator
 
         check_generator(state, config, path)
+        floors.check(state, config, path)  # nor with other sky floors
 
     # Training loop
     while cur_step < total_steps:
@@ -384,13 +394,14 @@ def main():
             cur_step += 1
             # cur_step now counts completed steps, so a resumed run continues exactly here
             if cur_step % save_steps == 0:
-                save_checkpoint(ckpt_dir / f"step_{cur_step:08d}.pt", pix2pix, cur_step, model_name)
+                save_checkpoint(ckpt_dir / f"step_{cur_step:08d}.pt", pix2pix, cur_step, model_name,
+                                sky_floors)
             if cur_step % latest_every == 0:
-                save_checkpoint(latest, pix2pix, cur_step, model_name)
+                save_checkpoint(latest, pix2pix, cur_step, model_name, sky_floors)
             if cur_step >= total_steps:
                 break
 
-    save_checkpoint(latest, pix2pix, cur_step, model_name)
+    save_checkpoint(latest, pix2pix, cur_step, model_name, sky_floors)
     # Whole-model files for the inference snippet in the README
     torch.save(pix2pix.gen, ckpt_dir / f'gen_pix2pixsr_{model_name}_final.pt')
     torch.save(pix2pix.patch_gan, ckpt_dir / f'patchgan_pix2pixsr_{model_name}_final.pt')

@@ -25,7 +25,9 @@ Three steps, each a subcommand:
             add_negative_noise): in each window, pixels exactly 0 (the generator's tanh saturated
             at -1) become minus a random draw from the window's positive pixels outside sources
             (photutils segmentation above mean + 3 std, 5 px). This happens per window, before
-            morpheus averages the overlapping windows.
+            morpheus averages the overlapping windows. A model trained with [DATASET] sky floors
+            (neo/data/floors.py) is run with its own clip and signed log scale, predicts the
+            negative sky itself and needs --negative-noise none.
   finalize  (run at the end of sr; rerun on its own if needed) turns morpheus's output.fits/n.fits
             into nJy images with the HR WCS: sr_mean (the mosaic), sr_std (spread of the window
             predictions), sr_n (windows per pixel) and sr_paper (the paper's display image: where
@@ -188,15 +190,16 @@ def write_lr(path, stored, bad, wcs, cards) -> None:
 # ── per-window model ───────────────────────────────────────────────────────────────────────────
 
 
-def window_to_input(window: np.ndarray):
+def window_to_input(window: np.ndarray, floor: float = 0.0):
     """One 100 x 100 LR window (stored units) -> the generator's (1, 1, 128, 128) input, through
-    the training dataset's own clip / ds9 scale / reflection-pad steps (neo.data.dataset)."""
+    the training dataset's own clip / ds9 scale / reflection-pad steps (neo.data.dataset), with
+    the run's [DATASET] lr_floor (neo/data/floors.py; 0 = the paper's clip at zero)."""
     import torchvision.transforms as transforms
 
     from neo.data.dataset import SquarePad, SR_HST_HSC_Dataset
 
-    clipped = SR_HST_HSC_Dataset.clip(np.asarray(window, dtype=np.float32), use_data=False)[0]
-    scaled = SR_HST_HSC_Dataset.ds9_scaling(clipped, offset=1).astype(np.float32)
+    window = np.asarray(window, dtype=np.float32)
+    scaled = SR_HST_HSC_Dataset.floor_scaling(window, floor).astype(np.float32)
     pad = transforms.Compose([transforms.ToPILImage(mode="F"), SquarePad(PAD, "reflect")])
     return transforms.ToTensor()(pad(scaled)).unsqueeze(0)  # (1, 1, 128, 128)
 
@@ -232,6 +235,8 @@ def make_window_model(
     batch: int = 1,
     negative_noise: str = "none",
     seed: int = 0,
+    hr_floor: float = 0.0,
+    lr_floor: float = 0.0,
 ):
     """The callable morpheus-core calls: (B, 100, 100, 1) LR windows -> (B, 600, 600, 1) HR
     windows in the HR pair units.
@@ -240,7 +245,8 @@ def make_window_model(
     (and, with rot4, each rotation) are run `batch` at a time; batch 1 keeps train-mode batch
     norm on each window's own statistics, as the paper did. negative_noise="paper" applies
     add_negative_noise to each window's final (reduced) prediction; the returned callable's
-    `stats` dict counts the windows and the pixels it filled.
+    `stats` dict counts the windows and the pixels it filled. hr_floor / lr_floor: the run's
+    [DATASET] sky floors (neo/data/floors.py); the paper's zero refill needs floors of 0.
     """
     import torch
 
@@ -252,6 +258,11 @@ def make_window_model(
         raise ValueError(f"reduce must be one of {REDUCE_CHOICES}")
     if negative_noise not in NEGATIVE_NOISE_CHOICES:
         raise ValueError(f"negative_noise must be one of {NEGATIVE_NOISE_CHOICES}")
+    if negative_noise == "paper" and (hr_floor or lr_floor):
+        raise ValueError(
+            "negative_noise 'paper' refills the zeros of the paper's clip at 0; a model trained "
+            "with sky floors predicts negative sky itself: use negative_noise 'none'"
+        )
     turns = (0, 1, 2, 3) if tta == "rot4" else (0,)
     rng = np.random.default_rng(seed)
     stats = {"windows": 0, "windows_with_zeros": 0, "zero_pixels": 0, "max_zero_frac": 0.0}
@@ -265,7 +276,7 @@ def make_window_model(
     def model(batch_inputs):
         # morpheus passes one (B, 100, 100, 1) batch per input image; there is one input
         windows = np.asarray(batch_inputs[0])[..., 0]
-        base = [window_to_input(w) for w in windows]
+        base = [window_to_input(w, lr_floor) for w in windows]
         # one (len(turns), ...) stack per window, rotated inputs ordered window-major
         inputs = [torch.rot90(x, k, dims=(-2, -1)) for x in base for k in turns]
         outputs = run(inputs)
@@ -275,7 +286,8 @@ def make_window_model(
                 torch.rot90(outputs[i * len(turns) + j], -k, dims=(-2, -1)).numpy()[0]
                 for j, k in enumerate(turns)
             ]
-            physical = to_physical(np.stack(per_turn))  # (turns, 600, 600), linear HR units
+            # (turns, 600, 600), linear HR units
+            physical = to_physical(np.stack(per_turn), hr_floor)
             if len(turns) == 1:
                 window = physical[0]
             elif reduce == "median":
@@ -488,6 +500,7 @@ def cmd_sr(args) -> None:
     import torch
     from morpheus_core import morpheus_core
 
+    from neo.data.floors import any_floor, floors
     from neo.eval.predict import pick_device
     from neo.eval.predictors import build_predictor
 
@@ -509,12 +522,15 @@ def cmd_sr(args) -> None:
     previous = [out / name for name in MOSAIC_FILES if (out / name).exists()]
     if previous and not args.overwrite:
         raise SystemExit(f"{out} holds a mosaic ({previous[0].name}); pass --overwrite to redo it")
-    for path in previous:  # all of the old run, so no old product outlives a failed rerun
-        path.unlink()
-    out.mkdir(parents=True, exist_ok=True)
     config = configparser.ConfigParser()
     config.read(args.config)
     device = pick_device(args.device)
+    sky_floors = floors(config)
+    if any_floor(sky_floors) and args.negative_noise == "paper":
+        raise SystemExit(
+            f"{args.config} trains with sky floors {sky_floors}: the model predicts negative sky "
+            "itself, so pass --negative-noise none (mosaic.sbatch: NEG_NOISE=none)"
+        )
     predict = build_predictor(config, args.checkpoint, device, mode=args.gen_mode)
     model = make_window_model(
         lambda x: predict(x, None),
@@ -523,7 +539,13 @@ def cmd_sr(args) -> None:
         batch=args.gen_batch,
         negative_noise=args.negative_noise,
         seed=args.seed,
+        **sky_floors,
     )
+    # only now, after the config, floor and checkpoint checks (build_predictor refuses another
+    # generator's or another floor's checkpoint), is the old run removed
+    for path in previous:  # all of the old run, so no old product outlives a failed rerun
+        path.unlink()
+    out.mkdir(parents=True, exist_ok=True)
     n_windows = ((lr.shape[0] - WINDOW) // STRIDE + 1) * ((lr.shape[1] - WINDOW) // STRIDE + 1)
     passes = 4 if args.tta == "rot4" else 1
     print(
@@ -548,6 +570,7 @@ def cmd_sr(args) -> None:
         "aggregate": "mean_var",
         "windows": n_windows,
         "lr_badfrac": badfrac,
+        **sky_floors,
     }
     (out / "mosaic.json").write_text(json.dumps(meta, indent=1))
     experiment = None
@@ -589,6 +612,8 @@ def cmd_sr(args) -> None:
         "NEOREDUC": args.reduce,
         "NEONEG": args.negative_noise,
         "NEOGMODE": args.gen_mode,
+        "NEOHRFL": (sky_floors["hr_floor"], "[DATASET] hr_floor the model was trained with"),
+        "NEOLRFL": (sky_floors["lr_floor"], "[DATASET] lr_floor the model was trained with"),
         "MSTRIDE": STRIDE,
         "MWINDOW": WINDOW,
     }

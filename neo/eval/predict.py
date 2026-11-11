@@ -51,6 +51,7 @@ import torch  # noqa: E402
 from astropy.io import fits  # noqa: E402
 from astropy.wcs import WCS  # noqa: E402
 
+from neo.data import floors  # noqa: E402
 from neo.data.dataset import SR_HST_HSC_Dataset  # noqa: E402
 from neo.eval import stack  # noqa: E402
 from neo.eval.postprocess import (  # noqa: E402
@@ -69,7 +70,7 @@ N_EXAMPLES = 3
 # Cards added after the reuse check existed, with what their absence means: a prediction written
 # before NEONOISE was recorded can only be the clean output, so a default run reuses it (every
 # directory predicted on Lux so far) and --noise hst still refuses it.
-LEGACY_CARDS = {"NEONOISE": "none"}
+LEGACY_CARDS = {"NEONOISE": "none", "NEOHRFL": 0.0, "NEOLRFL": 0.0}
 
 
 def pick_device(name: str) -> str:
@@ -159,6 +160,7 @@ def main(argv=None) -> None:
     config.read(args.config)
 
     split = Path(args.split_dir)
+    sky_floors = floors.floors(config)  # the run's clip (neo/data/floors.py), in and out
     dataset = SR_HST_HSC_Dataset(
         hst_path=str(split / "hr"),
         hsc_path=str(split / "lr"),
@@ -167,6 +169,7 @@ def main(argv=None) -> None:
         transform_type="ds9_scale",
         data_aug=False,
         experiment=None,
+        **sky_floors,
     )
     model = generator_name(config)
     if args.samples > 1 and model != "diffusion" and args.gen_mode == "eval":
@@ -207,6 +210,9 @@ def main(argv=None) -> None:
         "NEOSTEP": step,
         "NEOGMODE": args.gen_mode,
         "NEONOISE": args.noise,
+        # the run's [DATASET] sky floors (neo/data/floors.py); compare.py --paper-mode reads them
+        "NEOHRFL": sky_floors["hr_floor"],
+        "NEOLRFL": sky_floors["lr_floor"],
     }
     experiment = None
     if not args.no_comet:
@@ -273,7 +279,9 @@ def main(argv=None) -> None:
             torch.manual_seed(args.seed + start + 1000 * k)
             draws.append(predict(lr, cond).detach().float().cpu())
         draws = torch.stack(draws)
-        images = stack.stack(draws) if args.samples > 1 else {None: draws[0]}
+        images = (
+            stack.stack(draws, sky_floors["hr_floor"]) if args.samples > 1 else {None: draws[0]}
+        )
         for j, (name, hst, hsc, _, hr_header) in enumerate(batch):
             target = hst.numpy()
             base = cropped_wcs_header(split / "hr" / name, HR_SIZE)
@@ -292,7 +300,7 @@ def main(argv=None) -> None:
                     l1 = stack.l1(p, target)
                     header["L1LOG"] = l1
                     rows[kind].append({"name": name, "l1_log": l1})
-                    sr = to_physical(p) * njy
+                    sr = to_physical(p, sky_floors["hr_floor"]) * njy
                 fits.PrimaryHDU(sr.astype(np.float32), header=header).writeto(
                     dirs[kind] / name, overwrite=True
                 )

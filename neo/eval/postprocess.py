@@ -25,9 +25,15 @@ def center_crop(a: np.ndarray, size: int) -> np.ndarray:
     return a[..., y0 : y0 + size, x0 : x0 + size]
 
 
-def to_physical(output: np.ndarray) -> np.ndarray:
-    """(…, 768, 768) model output in log space -> (…, 600, 600) image in the HR pair units."""
+def to_physical(output: np.ndarray, floor: float = 0.0) -> np.ndarray:
+    """(…, 768, 768) model output in log space -> (…, 600, 600) image in the HR pair units.
+
+    floor: the run's [DATASET] hr_floor (neo/data/floors.py), which log space -1 stands for."""
     cropped = center_crop(np.asarray(output, dtype=np.float64), HR_SIZE)
+    if floor:
+        from neo.data.floors import unscale
+
+        return unscale(cropped, floor)
     return SR_HST_HSC_Dataset.ds9_unscaling(cropped, a=LOG_SCALE_A, offset=LOG_SCALE_OFFSET)
 
 

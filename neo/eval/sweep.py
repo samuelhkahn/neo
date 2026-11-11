@@ -67,6 +67,7 @@ import torch.nn as nn  # noqa: E402
 from astropy.io import fits  # noqa: E402
 from torchvision.transforms import CenterCrop  # noqa: E402
 
+from neo.data import floors  # noqa: E402
 from neo.data.augment import dataset_classes  # noqa: E402
 from neo.eval import fine_structure, stack, stars  # noqa: E402
 from neo.eval.postprocess import HR_SIZE, center_crop, njy_per_px, to_physical  # noqa: E402
@@ -116,6 +117,7 @@ def load_state(path: Path, config=None) -> dict:
     state = torch.load(path, map_location="cpu", weights_only=True)
     if config is not None:
         check_generator(state, config, path)
+        floors.check(state, config, path)
     return state
 
 
@@ -158,6 +160,7 @@ def load_images(config, limit=None, star_options=None):
         transform_type="ds9_scale",
         data_aug=False,
         experiment=None,
+        **floors.floors(config),
     )
     order = sorted(range(len(dataset)), key=lambda i: dataset.filenames[i])[:limit]
     images = []
@@ -205,13 +208,15 @@ def evaluate(
     mode="train",
     noise=None,
     ensemble=1,
+    hr_floor=0.0,
 ):
     """Per-image losses and the pooled fine-structure result for one set of weights, as
     {variant: (rows, fine)}: variant "" is the single pass; with ensemble K > 1 also ":medianK"
     and ":meanK", the stacks of K passes (module docstring).
 
     noise: the run's NoiseModel ([NOISE]) or None; with it the discriminator sees the clean
-    output plus the target's sky noise, as in training."""
+    output plus the target's sky noise, as in training. hr_floor: the run's [DATASET] hr_floor
+    (neo/data/floors.py), which the output's log space -1 stands for."""
     gen.train(mode == "train")
     disc.train(mode == "train")
     bce = nn.BCEWithLogitsLoss()
@@ -219,7 +224,9 @@ def evaluate(
     variants = variant_labels(ensemble)
     accs = {v: fine_structure.Accumulator(spectra) for v in variants}
     rows = {v: [] for v in variants}
-    saturation_log = float(to_physical(np.full((1, 768, 768), SATURATION_LOG))[0, 0, 0])
+    saturation_log = float(
+        to_physical(np.full((1, 768, 768), SATURATION_LOG), hr_floor)[0, 0, 0]
+    )
     for i, im in enumerate(images):
         lr = im["lr"][None, None].to(device)
         r = crop(im["hst"][None, None].to(device))
@@ -238,7 +245,7 @@ def evaluate(
                 torch.manual_seed(seed + i + 1000 * k)
                 draws.append(gen(lr).float().cpu())
             stacked = stack.stack(
-                torch.stack(draws)
+                torch.stack(draws), hr_floor
             )  # on the CPU: the log/linear maps need float64
             torch.manual_seed(seed + i + 1000 * ensemble)  # one fixed noise draw for the stacks
             for kind in STACKS:
@@ -261,7 +268,7 @@ def evaluate(
                     ).item(),
                 }
             )
-            sr_njy = to_physical(out[0, 0].float().cpu().numpy()) * im["njy"]
+            sr_njy = to_physical(out[0, 0].float().cpu().numpy(), hr_floor) * im["njy"]
             accs[variant].add(hst_sources[i], sr_njy, saturation_log * im["njy"])
     return {v: (rows[v], accs[v].result()) for v in variants}
 
@@ -531,6 +538,7 @@ def main(argv=None):
     vgg = VGGLoss(device, weights=weights)
     # the run's cached template (or [NOISE] template) only: never measure one from local pairs
     noise = None
+    floors.unsupported_with(floors.floors(config), config)
     if NoiseModel.enabled(config):
         noise = NoiseModel.from_config(config, device, measure=False)
     identifier = config.get("IDENTIFIER", "identifier", fallback="").strip('"')
@@ -561,6 +569,7 @@ def main(argv=None):
             args.mode,
             noise,
             args.ensemble,
+            hr_floor=floors.floors(config)["hr_floor"],
         )
         summaries, per_image = [], []
         for variant, (rows, fine) in results.items():
