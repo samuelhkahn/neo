@@ -272,7 +272,9 @@ def test_floor_clean_d_config_is_the_floor_config_with_the_clean_conditioning():
         ("CHECKPOINT", "ckpt_dir"),
         ("COMET_TAG", "comet_tag"),
         ("DATASET", "hsc_hr_8bit"),
+        ("GAN_STEPS", "gan_steps"),  # continued to 2.5M; _floor stopped at its 750k
     }
+    assert cfg["GAN_STEPS"]["gan_steps"] == "2500000"
     header = (CONFIGS / "lux_neo_relu_floor.ini").read_text().split("[DEFAULT]")[0]
     assert "CONFIG_B=neo/configs/lux_neo_relu_floor_cleand.ini" in header
     assert "train_pair.sbatch" in header
@@ -312,3 +314,22 @@ def test_compare_paper_mode_finds_floored_predictions(tmp_path):
         )
     preds = {m: tmp_path / m for m in ("paper", "floor")}
     assert compare.floored_models(preds, ["a.fits"]) == {"floor": (-0.01, -0.2)}
+
+
+def test_floor_clean_d_d4_config_is_the_clean_d_config_with_d4_augmentation():
+    base = read_config(CONFIGS / "lux_neo_relu_floor_cleand.ini")
+    cfg = read_config(CONFIGS / "lux_neo_relu_floor_cleand_d4.ini")
+    name = "lux_cosmosweb_i_neo_relu_floor_cleand_d4"
+    assert cfg["IDENTIFIER"]["identifier"] == f'"{name}"'
+    assert cfg["CHECKPOINT"]["ckpt_dir"] == "${NEO_DATA}/checkpoints/" + name
+    assert cfg["COMET_TAG"]["comet_tag"].strip('"').endswith(" neo_relu_floor_cleand_d4")
+    assert cfg["DATA_AUG"]["augment"] == "shift_d4"
+    assert config_diff(base, cfg) == {
+        ("IDENTIFIER", "identifier"),
+        ("CHECKPOINT", "ckpt_dir"),
+        ("COMET_TAG", "comet_tag"),
+        ("DATA_AUG", "augment"),
+    }
+    header = (CONFIGS / "lux_neo_relu_floor_cleand_d4.ini").read_text().split("[DEFAULT]")[0]
+    assert "CONFIG_B=neo/configs/lux_neo_relu_floor_cleand_d4.ini" in header
+    assert "from scratch" in header
